@@ -1,0 +1,16 @@
+name: nakama1
+logger:
+  level: INFO
+session:
+  token_expiry_sec: 7200
+socket:
+  server_key: defaultkey
+console:
+  username: admin
+  password: password
+  email: admin@admin.com
+runtime:
+  path: /nakama/data/modules/build
+  js_entrypoint: /nakama/data/modules/build/index.js
+match:
+  max_empty_sec: 0
