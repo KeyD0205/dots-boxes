@@ -36,11 +36,8 @@ describe('Dots and Boxes rules', () => {
     });
 
     test('boxesAffected returns correct boxes', () => {
-      // Vertical edge
       expect(boxesAffected(4, '1,2-1,3')).toEqual(['0,2', '1,2']);
-      // Horizontal edge
       expect(boxesAffected(4, '2,1-3,1')).toEqual(['2,0', '2,1']);
-      // Edge at border
       expect(boxesAffected(4, '0,0-0,1')).toEqual(['0,0']);
       expect(boxesAffected(4, '3,2-3,3')).toEqual(['2,2']);
     });
@@ -48,19 +45,51 @@ describe('Dots and Boxes rules', () => {
     test('markDisconnected sets player as disconnected and removes from spectators', () => {
       let state = createInitialSnapshot('ROOM01', 3, { userId: 'p1', username: 'Ada' });
       state = addPlayer(state, 'p2', 'Linus');
-      // Add as spectator too
-      state.spectators.push({ userId: 'p2', username: 'Linus', sessionId: 'sess42' });
+      state.spectators.push({ userId: 'p2', username: 'Linus', sessionId: 'sess42' } as any);
+
       const updated = markDisconnected(state, 'p2');
-      expect(updated.players.find(p => p.userId === 'p2')?.isConnected).toBe(false);
-      expect(updated.spectators.some(s => s.userId === 'p2')).toBe(false);
+
+      expect(updated.players.find((p) => p.userId === 'p2')?.isConnected).toBe(false);
+      expect(updated.spectators.some((s) => s.userId === 'p2')).toBe(false);
+    });
+
+    test('addPlayer reconnects existing player and removes them from spectators', () => {
+      let state = createInitialSnapshot('ROOM01', 3, { userId: 'p1', username: 'Ada' });
+      state = addPlayer(state, 'p2', 'Linus');
+      state = markDisconnected(state, 'p2');
+      state.spectators.push({ userId: 'p2', username: 'OldName', sessionId: 'sess42' } as any);
+
+      const updated = addPlayer(state, 'p2', 'Linus-New');
+
+      expect(updated.players.find((p) => p.userId === 'p2')?.isConnected).toBe(true);
+      expect(updated.players.find((p) => p.userId === 'p2')?.username).toBe('Linus-New');
+      expect(updated.spectators.some((s) => s.userId === 'p2')).toBe(false);
     });
   });
+
   test('starts active when second player joins', () => {
     let state = createInitialSnapshot('ROOM01', 3, { userId: 'p1', username: 'Ada' });
     state = addPlayer(state, 'p2', 'Linus');
     state = startIfReady(state);
+
     expect(state.status).toBe('active');
     expect(state.currentTurnUserId).toBe('p1');
+  });
+
+  test('rejects move when game is not active', () => {
+    const state = createInitialSnapshot('ROOM01', 3, { userId: 'p1', username: 'Ada' });
+    const result = applyMove(state, 'p1', edgeKey(0, 0, 1, 0));
+
+    expect(result.error).toBe('Game is not active.');
+  });
+
+  test('rejects move when it is not the player turn', () => {
+    let state = createInitialSnapshot('ROOM01', 3, { userId: 'p1', username: 'Ada' });
+    state = addPlayer(state, 'p2', 'Linus');
+    state = startIfReady(state);
+
+    const result = applyMove(state, 'p2', edgeKey(0, 0, 1, 0));
+    expect(result.error).toBe('It is not your turn.');
   });
 
   test('rejects duplicate edges', () => {
@@ -70,8 +99,18 @@ describe('Dots and Boxes rules', () => {
 
     const move1 = applyMove(state, 'p1', edgeKey(0, 0, 1, 0));
     expect(move1.error).toBeUndefined();
+
     const move2 = applyMove(move1.snapshot, 'p2', edgeKey(0, 0, 1, 0));
     expect(move2.error).toBe('Edge already taken.');
+  });
+
+  test('rejects invalid edge', () => {
+    let state = createInitialSnapshot('ROOM01', 3, { userId: 'p1', username: 'Ada' });
+    state = addPlayer(state, 'p2', 'Linus');
+    state = startIfReady(state);
+
+    const result = applyMove(state, 'p1', '0,0-2,0');
+    expect(result.error).toBe('Invalid edge.');
   });
 
   test('completing a box grants an extra turn and score', () => {
@@ -90,10 +129,52 @@ describe('Dots and Boxes rules', () => {
     expect(result.snapshot.currentTurnUserId).toBe('p2');
   });
 
-  test('finishes game when all edges are drawn', () => {
-    let state = createInitialSnapshot('ROOM01', 2, { userId: 'p1', username: 'Ada' });
+  test('one move can complete two boxes', () => {
+    let state = createInitialSnapshot('ROOM01', 3, { userId: 'p1', username: 'Ada' });
     state = addPlayer(state, 'p2', 'Linus');
     state = startIfReady(state);
+
+    state = {
+      ...state,
+      edges: {
+        [edgeKey(0, 0, 1, 0)]: 'p1',
+        [edgeKey(0, 0, 0, 1)]: 'p1',
+        [edgeKey(0, 1, 0, 2)]: 'p1',
+        [edgeKey(0, 2, 1, 2)]: 'p1',
+        [edgeKey(1, 0, 2, 0)]: 'p1',
+        [edgeKey(2, 0, 2, 1)]: 'p1',
+        [edgeKey(2, 1, 2, 2)]: 'p1',
+        [edgeKey(1, 2, 2, 2)]: 'p1',
+        [edgeKey(1, 0, 1, 1)]: 'p1',
+        [edgeKey(1, 1, 1, 2)]: 'p1',
+      },
+      currentTurnUserId: 'p2',
+      status: 'active',
+    };
+
+    const result = applyMove(state, 'p2', edgeKey(0, 1, 1, 1));
+
+    expect(result.error).toBeUndefined();
+    expect(result.completedBoxes.sort()).toEqual(['0,0', '0,1']);
+    expect(result.snapshot.scores.p2).toBe(2);
+    expect(result.snapshot.currentTurnUserId).toBe('p2');
+  });
+
+  test('finishes game when all edges are drawn', () => {
+    let state = createInitialSnapshot('ROOM01', 3, { userId: 'p1', username: 'Ada' });
+    state = addPlayer(state, 'p2', 'Linus');
+    state = startIfReady(state);
+
+    state = {
+      ...state,
+      gridSize: 2,
+      status: 'active',
+      edges: {},
+      boxes: {},
+      scores: { p1: 0, p2: 0 },
+      moveLog: [],
+      currentTurnUserId: 'p1',
+    };
 
     const edges = [
       edgeKey(0, 0, 1, 0),
@@ -101,8 +182,10 @@ describe('Dots and Boxes rules', () => {
       edgeKey(0, 1, 1, 1),
       edgeKey(1, 0, 1, 1),
     ];
+
     let current = state;
     let player = 'p1';
+
     for (const key of edges) {
       const res = applyMove(current, player, key);
       current = res.snapshot;
