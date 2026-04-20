@@ -19,7 +19,7 @@ function isRoomRecord(obj: any): obj is RoomRecord {
 /**
  * Write a RoomRecord to storage.
  */
-export function writeRoom(nk: nkruntime.Nakama, room: RoomRecord): void {
+export function writeRoom(nk: nkruntime.Nakama, logger: nkruntime.Logger, room: RoomRecord): void {
   try {
     nk.storageWrite([
       {
@@ -32,7 +32,7 @@ export function writeRoom(nk: nkruntime.Nakama, room: RoomRecord): void {
       },
     ]);
   } catch (err) {
-    nk.logger?.error?.(`Failed to write room: ${room.roomCode} - ${err}`);
+    logger?.error?.(`Failed to write room: ${room.roomCode} - ${err}`);
   }
 }
 
@@ -40,7 +40,7 @@ export function writeRoom(nk: nkruntime.Nakama, room: RoomRecord): void {
 /**
  * Read a RoomRecord from storage by room code.
  */
-export function readRoom(nk: nkruntime.Nakama, roomCode: string): RoomRecord | null {
+export function readRoom(nk: nkruntime.Nakama, logger: nkruntime.Logger, roomCode: string): RoomRecord | null {
   try {
     const rows = nk.storageRead([
       { collection: ROOM_COLLECTION, key: roomCode, userId: SYSTEM_USER },
@@ -50,11 +50,11 @@ export function readRoom(nk: nkruntime.Nakama, roomCode: string): RoomRecord | n
     if (isRoomRecord(value)) {
       return value;
     } else {
-      nk.logger?.warn?.(`Storage value for room ${roomCode} is not a valid RoomRecord.`);
+      logger?.warn?.(`Storage value for room ${roomCode} is not a valid RoomRecord.`);
       return null;
     }
   } catch (err) {
-    nk.logger?.error?.(`Failed to read room: ${roomCode} - ${err}`);
+    logger?.error?.(`Failed to read room: ${roomCode} - ${err}`);
     return null;
   }
 }
@@ -63,7 +63,7 @@ export function readRoom(nk: nkruntime.Nakama, roomCode: string): RoomRecord | n
 /**
  * Write a MatchHistoryRecord to storage.
  */
-export function writeHistory(nk: nkruntime.Nakama, history: MatchHistoryRecord): void {
+export function writeHistory(nk: nkruntime.Nakama, logger: nkruntime.Logger, history: MatchHistoryRecord): void {
   try {
     nk.storageWrite([
       {
@@ -76,7 +76,7 @@ export function writeHistory(nk: nkruntime.Nakama, history: MatchHistoryRecord):
       },
     ]);
   } catch (err) {
-    nk.logger?.error?.(`Failed to write history for room: ${history.roomCode} - ${err}`);
+    logger?.error?.(`Failed to write history for room: ${history.roomCode} - ${err}`);
   }
 }
 

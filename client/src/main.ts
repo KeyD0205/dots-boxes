@@ -60,18 +60,30 @@ const state = {
 };
 
 // --- Session Persistence ---
-const SESSION_TOKEN_KEY = 'nakamaSessionToken';
+const SESSION_KEY = 'nakamaSession';
 
-function saveSessionToken(token: string) {
-  localStorage.setItem(SESSION_TOKEN_KEY, token);
+function saveSession(session: Session) {
+  localStorage.setItem(SESSION_KEY, JSON.stringify({ token: session.token, refresh_token: session.refresh_token }));
 }
 
-function loadSessionToken(): string | null {
-  return localStorage.getItem(SESSION_TOKEN_KEY);
+function loadSession(): Session | null {
+  const str = localStorage.getItem(SESSION_KEY);
+  if (!str) return null;
+  try {
+    const obj = JSON.parse(str);
+    if (obj && obj.token) {
+      const session = Session.restore(obj.token, obj.refresh_token);
+      if (!session.isexpired(Date.now() / 1000)) {
+        return session;
+      }
+    }
+  } catch {}
+  clearSession();
+  return null;
 }
 
-function clearSessionToken() {
-  localStorage.removeItem(SESSION_TOKEN_KEY);
+function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
 }
 
 const logLines: string[] = [];
@@ -86,8 +98,8 @@ app.innerHTML = `
       <div class="row">
         <input id="username" placeholder="Username" maxlength="24" />
         <select id="gridSize">
-          <option value="5" selected>5x5 dots</option>
-          <option value="4">4x4 dots</option>
+          <option value="4" selected>4x4 dots</option>
+          <option value="5">5x5 dots</option>
           <option value="6">6x6 dots</option>
           <option value="7">7x7 dots</option>
         </select>
@@ -306,26 +318,12 @@ async function connect() {
       throw new Error('Invalid username');
     }
 
-    // Try to restore session from localStorage
-    let session: Session | null = null;
-    const token = loadSessionToken();
-    if (token) {
-      try {
-        session = Session.restore(token);
-        // If expired, clear and re-authenticate
-        if (session && session.isexpired(Date.now() / 1000)) {
-          clearSessionToken();
-          session = null;
-        }
-      } catch (e) {
-        clearSessionToken();
-        session = null;
-      }
-    }
 
+    // Try to restore session from localStorage
+    let session: Session | null = loadSession();
     if (!session) {
       session = await client.authenticateDevice(getDeviceId(), true, username);
-      saveSessionToken(session.token);
+      saveSession(session);
     }
 
     state.session = session;
@@ -354,17 +352,17 @@ async function createRoom() {
     showErrorNotification('Not connected. Please connect first.');
     return;
   }
-  
+
   log('Creating room...');
   const result = await rpc<{ roomCode: string; matchId: string; snapshot: Snapshot }>('create_room', {
     username: getUsername(),
     gridSize: Number(gridSizeInput.value),
   });
-  
+
   log(`Create room response: roomCode="${result.roomCode}" (length: ${result.roomCode.length})`);
   roomCodeInput.value = result.roomCode;
-  
-  // Join the room we just created by passing the code directly
+
+  // Now, call joinRoomWithCode as a player (not spectator)
   await joinRoomWithCode(result.roomCode, false);
 }
 
@@ -537,7 +535,7 @@ refreshHistoryBtn.addEventListener('click', addErrorHandler(refreshHistory, 'Ref
 if (loadSessionToken()) {
   connect().catch((err) => {
     log('Auto-connect failed: ' + extractErrorMessage(err));
-    clearSessionToken();
+    clearSession();
   });
 }
 
