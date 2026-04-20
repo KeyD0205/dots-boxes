@@ -59,6 +59,21 @@ const state = {
   isConnected: false,
 };
 
+// --- Session Persistence ---
+const SESSION_TOKEN_KEY = 'nakamaSessionToken';
+
+function saveSessionToken(token: string) {
+  localStorage.setItem(SESSION_TOKEN_KEY, token);
+}
+
+function loadSessionToken(): string | null {
+  return localStorage.getItem(SESSION_TOKEN_KEY);
+}
+
+function clearSessionToken() {
+  localStorage.removeItem(SESSION_TOKEN_KEY);
+}
+
 const logLines: string[] = [];
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -136,6 +151,23 @@ function log(message: string) {
   logEl.textContent = logLines.slice(0, 60).join('\n');
 }
 
+function extractErrorMessage(err: any): string {
+  // Handle Response objects from Nakama client
+  if (err instanceof Response) {
+    return `HTTP ${err.status}: ${err.statusText}`;
+  }
+  // Handle error objects
+  if (err instanceof Error) {
+    return err.message;
+  }
+  // Handle objects with message property
+  if (typeof err === 'object' && err !== null && 'message' in err) {
+    return String(err.message);
+  }
+  // Fallback
+  return String(err);
+}
+
 function showErrorNotification(message: string) {
   const notification = document.createElement('div');
   notification.className = 'notification error';
@@ -155,7 +187,7 @@ function validateUsername(username: string): boolean {
 function addErrorHandler(fn: () => Promise<void>, label: string) {
   return () => {
     fn().catch((err) => {
-      const msg = `${label} failed: ${String(err)}`;
+      const msg = `${label} failed: ${extractErrorMessage(err)}`;
       log(msg);
       showErrorNotification(msg);
     });
@@ -178,25 +210,33 @@ function getUsername() {
 
 async function rpc<T>(id: string, body: unknown): Promise<T> {
   if (!state.session) throw new Error('Not authenticated');
-  const result = await client.rpc(state.session, id, JSON.stringify(body));
   
-  // Handle both string and object payloads
-  if (typeof result.payload === 'string') {
-    return JSON.parse(result.payload) as T;
-  } else if (typeof result.payload === 'object' && result.payload !== null) {
-    return result.payload as T;
-  } else {
-    throw new Error(`Invalid RPC response: ${String(result.payload)}`);
+  try {
+    const result = await client.rpc(state.session, id, JSON.stringify(body));
+    log(`RPC ${id} response: payload type = ${typeof result.payload}`);
+    
+    // Handle both string and object payloads
+    if (typeof result.payload === 'string') {
+      return JSON.parse(result.payload) as T;
+    } else if (typeof result.payload === 'object' && result.payload !== null) {
+      return result.payload as T;
+    } else {
+      throw new Error(`Invalid RPC response: ${String(result.payload)}`);
+    }
+  } catch (err) {
+    log(`RPC ${id} error: ${extractErrorMessage(err)}`);
+    throw err;
   }
 }
 
 async function disconnect() {
-  state.socket?.close();
+  state.socket?.disconnect(true);
   state.session = null;
   state.snapshot = null;
   state.currentMatchId = null;
   state.isConnected = false;
   state.isSpectator = false;
+  clearSessionToken();
 }
 
 function setupSocketHandlers() {
@@ -246,7 +286,7 @@ function setupSocketHandlers() {
           log('Rejoined match after reconnect.');
         }
       } catch (err) {
-        log(`Reconnect attempt ${reconnectAttempts} failed: ${String(err)}`);
+        log(`Reconnect attempt ${reconnectAttempts} failed: ${extractErrorMessage(err)}`);
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
           authState.textContent = 'Reconnection failed';
           showErrorNotification('Connection lost. Please refresh the page.');
@@ -266,13 +306,35 @@ async function connect() {
       throw new Error('Invalid username');
     }
 
-    state.session = await client.authenticateDevice(getDeviceId(), true, username);
-    state.currentUserId = state.session.user_id;
+    // Try to restore session from localStorage
+    let session: Session | null = null;
+    const token = loadSessionToken();
+    if (token) {
+      try {
+        session = Session.restore(token);
+        // If expired, clear and re-authenticate
+        if (session && session.isexpired(Date.now() / 1000)) {
+          clearSessionToken();
+          session = null;
+        }
+      } catch (e) {
+        clearSessionToken();
+        session = null;
+      }
+    }
+
+    if (!session) {
+      session = await client.authenticateDevice(getDeviceId(), true, username);
+      saveSessionToken(session.token);
+    }
+
+    state.session = session;
+    state.currentUserId = session.user_id;
     state.socket = client.createSocket(useSSL, false);
-    await state.socket.connect(state.session, true);
-    
+    await state.socket.connect(session, true);
+
     setupSocketHandlers();
-    
+
     state.isConnected = true;
     state.isConnecting = false;
     authState.textContent = `Connected as ${username}`;
@@ -293,23 +355,24 @@ async function createRoom() {
     return;
   }
   
+  log('Creating room...');
   const result = await rpc<{ roomCode: string; matchId: string; snapshot: Snapshot }>('create_room', {
     username: getUsername(),
     gridSize: Number(gridSizeInput.value),
   });
+  
+  log(`Create room response: roomCode="${result.roomCode}" (length: ${result.roomCode.length})`);
   roomCodeInput.value = result.roomCode;
-  await joinRoom(false);
+  
+  // Join the room we just created by passing the code directly
+  await joinRoomWithCode(result.roomCode, false);
 }
 
-async function joinRoom(spectator: boolean) {
-  if (!state.isConnected) {
-    showErrorNotification('Not connected. Please connect first.');
-    return;
-  }
+async function joinRoomWithCode(roomCode: string, spectator: boolean) {
+  log(`joinRoomWithCode: roomCode="${roomCode}" (length: ${roomCode.length})`);
   
-  const roomCode = roomCodeInput.value.trim().toUpperCase();
   if (!validateRoomCode(roomCode)) {
-    showErrorNotification('Invalid room code. Must be 6 alphanumeric characters.');
+    showErrorNotification('Invalid room code. Must be 6 alphanumeric characters (e.g., ABC123).');
     return;
   }
   
@@ -321,9 +384,28 @@ async function joinRoom(spectator: boolean) {
   state.isSpectator = spectator;
   state.currentMatchId = result.matchId;
   state.snapshot = result.snapshot;
-  await state.socket!.joinMatch(result.matchId);
+  try {
+    await state.socket!.joinMatch(result.matchId);
+    log(`[joinMatch] Successfully joined match: ${result.matchId}`);
+  } catch (err) {
+    log(`[joinMatch] Failed to join match: ${extractErrorMessage(err)}`);
+    showErrorNotification('Failed to join match. Please refresh and try again.');
+    return;
+  }
   log(`${spectator ? 'Spectating' : 'Joined'} room ${roomCode}.`);
   render();
+}
+
+async function joinRoom(spectator: boolean) {
+  if (!state.isConnected) {
+    showErrorNotification('Not connected. Please connect first.');
+    return;
+  }
+  
+  const roomCode = roomCodeInput.value.trim().toUpperCase();
+  log(`joinRoom: roomCode input = "${roomCode}" (length: ${roomCode.length})`);
+  
+  await joinRoomWithCode(roomCode, spectator);
 }
 
 async function refreshHistory() {
@@ -450,4 +532,13 @@ createBtn.addEventListener('click', addErrorHandler(createRoom, 'Create room'));
 joinBtn.addEventListener('click', addErrorHandler(() => joinRoom(false), 'Join room'));
 spectateBtn.addEventListener('click', addErrorHandler(() => joinRoom(true), 'Spectate'));
 refreshHistoryBtn.addEventListener('click', addErrorHandler(refreshHistory, 'Refresh history'));
+
+// --- Auto-connect on page load if session token exists ---
+if (loadSessionToken()) {
+  connect().catch((err) => {
+    log('Auto-connect failed: ' + extractErrorMessage(err));
+    clearSessionToken();
+  });
+}
+
 render();

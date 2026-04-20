@@ -1,6 +1,60 @@
-import { addPlayer, applyMove, createInitialSnapshot, edgeKey, startIfReady, totalPossibleEdges } from '../src/game';
+import {
+  addPlayer,
+  applyMove,
+  createInitialSnapshot,
+  edgeKey,
+  startIfReady,
+  totalPossibleEdges,
+  normalizeGridSize,
+  isAdjacentEdge,
+  boxKey,
+  boxesAffected,
+  markDisconnected,
+} from '../src/game';
 
 describe('Dots and Boxes rules', () => {
+  describe('utility functions', () => {
+    test('normalizeGridSize clamps values', () => {
+      expect(normalizeGridSize()).toBe(5);
+      expect(normalizeGridSize(2)).toBe(3);
+      expect(normalizeGridSize(10)).toBe(8);
+      expect(normalizeGridSize(4)).toBe(4);
+      expect(normalizeGridSize(7.9)).toBe(7);
+    });
+
+    test('isAdjacentEdge validates edge keys', () => {
+      expect(isAdjacentEdge(3, '0,0-1,0')).toBe(true);
+      expect(isAdjacentEdge(3, '0,0-0,1')).toBe(true);
+      expect(isAdjacentEdge(3, '0,0-2,0')).toBe(false);
+      expect(isAdjacentEdge(3, '0,0-0,3')).toBe(false);
+      expect(isAdjacentEdge(3, '0,0-0,0')).toBe(false);
+      expect(isAdjacentEdge(3, 'bad-key')).toBe(false);
+    });
+
+    test('boxKey returns correct string', () => {
+      expect(boxKey(2, 3)).toBe('2,3');
+    });
+
+    test('boxesAffected returns correct boxes', () => {
+      // Vertical edge
+      expect(boxesAffected(4, '1,2-1,3')).toEqual(['0,2', '1,2']);
+      // Horizontal edge
+      expect(boxesAffected(4, '2,1-3,1')).toEqual(['2,0', '2,1']);
+      // Edge at border
+      expect(boxesAffected(4, '0,0-0,1')).toEqual(['0,0']);
+      expect(boxesAffected(4, '3,2-3,3')).toEqual(['2,2']);
+    });
+
+    test('markDisconnected sets player as disconnected and removes from spectators', () => {
+      let state = createInitialSnapshot('ROOM01', 3, { userId: 'p1', username: 'Ada' });
+      state = addPlayer(state, 'p2', 'Linus');
+      // Add as spectator too
+      state.spectators.push({ userId: 'p2', username: 'Linus', sessionId: 'sess42' });
+      const updated = markDisconnected(state, 'p2');
+      expect(updated.players.find(p => p.userId === 'p2')?.isConnected).toBe(false);
+      expect(updated.spectators.some(s => s.userId === 'p2')).toBe(false);
+    });
+  });
   test('starts active when second player joins', () => {
     let state = createInitialSnapshot('ROOM01', 3, { userId: 'p1', username: 'Ada' });
     state = addPlayer(state, 'p2', 'Linus');

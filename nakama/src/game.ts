@@ -1,12 +1,31 @@
 import { MatchMove, PlayerSeat, SerializedState } from './types';
 
+
+/** Player colors for assignment. */
 const COLORS = ['#2563eb', '#dc2626', '#16a34a', '#9333ea', '#ea580c', '#0891b2'];
 
+/** Minimum allowed grid size. */
+const MIN_GRID_SIZE = 3;
+/** Maximum allowed grid size. */
+const MAX_GRID_SIZE = 8;
+/** Default grid size. */
+const DEFAULT_GRID_SIZE = 5;
+/** Default reconnect grace period in seconds. */
+const DEFAULT_RECONNECT_GRACE_SEC = 60;
+
+
+/**
+ * Normalize the grid size to be within allowed bounds.
+ */
 export function normalizeGridSize(input?: number): number {
-  const n = input ?? 5;
-  return Math.max(3, Math.min(8, Math.floor(n)));
+  const n = input ?? DEFAULT_GRID_SIZE;
+  return Math.max(MIN_GRID_SIZE, Math.min(MAX_GRID_SIZE, Math.floor(n)));
 }
 
+
+/**
+ * Generate a unique key for an edge between two points.
+ */
 export function edgeKey(aX: number, aY: number, bX: number, bY: number): string {
   const [p1, p2] = [[aX, aY], [bX, bY]].sort((lhs, rhs) => {
     if (lhs[0] === rhs[0]) return lhs[1] - rhs[1];
@@ -15,6 +34,10 @@ export function edgeKey(aX: number, aY: number, bX: number, bY: number): string 
   return `${p1[0]},${p1[1]}-${p2[0]},${p2[1]}`;
 }
 
+
+/**
+ * Check if the edge key represents a valid adjacent edge within the grid.
+ */
 export function isAdjacentEdge(gridSize: number, key: string): boolean {
   const [a, b] = key.split('-');
   if (!a || !b) return false;
@@ -27,10 +50,18 @@ export function isAdjacentEdge(gridSize: number, key: string): boolean {
   return dx + dy === 1;
 }
 
+
+/**
+ * Generate a unique key for a box at (x, y).
+ */
 export function boxKey(x: number, y: number): string {
   return `${x},${y}`;
 }
 
+
+/**
+ * Get all edge keys for a box at (x, y).
+ */
 function boxEdges(x: number, y: number): string[] {
   return [
     edgeKey(x, y, x + 1, y),
@@ -40,6 +71,10 @@ function boxEdges(x: number, y: number): string[] {
   ];
 }
 
+
+/**
+ * Get the keys of boxes affected by an edge placement.
+ */
 export function boxesAffected(gridSize: number, key: string): string[] {
   const [a, b] = key.split('-');
   const [x1, y1] = a.split(',').map(Number);
@@ -59,6 +94,10 @@ export function boxesAffected(gridSize: number, key: string): string[] {
   return result;
 }
 
+
+/**
+ * Create the initial game state snapshot for a new room.
+ */
 export function createInitialSnapshot(roomCode: string, gridSize: number, creator: { userId: string; username: string }): SerializedState {
   const now = new Date().toISOString();
   const firstPlayer: PlayerSeat = {
@@ -84,10 +123,14 @@ export function createInitialSnapshot(roomCode: string, gridSize: number, creato
     scores: { [creator.userId]: 0 },
     moveLog: [],
     winnerIds: [],
-    reconnectGraceSec: 60,
+    reconnectGraceSec: DEFAULT_RECONNECT_GRACE_SEC,
   };
 }
 
+
+/**
+ * Add a player to the game snapshot, or reconnect if already present.
+ */
 export function addPlayer(snapshot: SerializedState, userId: string, username: string): SerializedState {
   if (snapshot.players.some((p) => p.userId === userId)) {
     return {
@@ -111,6 +154,10 @@ export function addPlayer(snapshot: SerializedState, userId: string, username: s
   };
 }
 
+
+/**
+ * Mark a player as disconnected in the snapshot.
+ */
 export function markDisconnected(snapshot: SerializedState, userId: string): SerializedState {
   return {
     ...snapshot,
@@ -119,6 +166,10 @@ export function markDisconnected(snapshot: SerializedState, userId: string): Ser
   };
 }
 
+
+/**
+ * Start the game if enough players are present and status is 'waiting'.
+ */
 export function startIfReady(snapshot: SerializedState): SerializedState {
   if (snapshot.status !== 'waiting') return snapshot;
   if (snapshot.players.length < 2) return snapshot;
@@ -130,21 +181,37 @@ export function startIfReady(snapshot: SerializedState): SerializedState {
   };
 }
 
+
+/**
+ * Calculate the total number of possible edges for a grid.
+ */
 export function totalPossibleEdges(gridSize: number): number {
   return (gridSize - 1) * gridSize * 2;
 }
 
+
+/**
+ * Get the userId of the next player in turn order.
+ */
 function nextTurn(snapshot: SerializedState, currentUserId: string): string | null {
   if (snapshot.players.length === 0) return null;
-  var idx = -1;
-  for (var i = 0; i < snapshot.players.length; i += 1) {
+  let idx = -1;
+  for (let i = 0; i < snapshot.players.length; i += 1) {
     if (snapshot.players[i].userId === currentUserId) { idx = i; break; }
   }
   if (idx < 0) return snapshot.players[0].userId;
   return snapshot.players[(idx + 1) % snapshot.players.length].userId;
 }
 
-export function applyMove(snapshot: SerializedState, playerId: string, key: string): { snapshot: SerializedState; error?: string; completedBoxes: string[] } {
+
+/**
+ * Apply a move to the game state, returning the updated snapshot and any completed boxes.
+ */
+export function applyMove(
+  snapshot: SerializedState,
+  playerId: string,
+  key: string
+): { snapshot: SerializedState; error?: string; completedBoxes: string[] } {
   if (snapshot.status !== 'active') return { snapshot, error: 'Game is not active.', completedBoxes: [] };
   if (snapshot.currentTurnUserId !== playerId) return { snapshot, error: 'It is not your turn.', completedBoxes: [] };
   if (!isAdjacentEdge(snapshot.gridSize, key)) return { snapshot, error: 'Invalid edge.', completedBoxes: [] };
@@ -185,12 +252,12 @@ export function applyMove(snapshot: SerializedState, playerId: string, key: stri
   };
 
   if (Object.keys(newEdges).length === totalPossibleEdges(snapshot.gridSize)) {
-    var highest = -Infinity;
-    for (var scoreKey in newScores) {
+    let highest = -Infinity;
+    for (const scoreKey in newScores) {
       if (newScores[scoreKey] > highest) highest = newScores[scoreKey];
     }
-    var winnerIds: string[] = [];
-    for (var userId in newScores) {
+    const winnerIds: string[] = [];
+    for (const userId in newScores) {
       if (newScores[userId] === highest) winnerIds.push(userId);
     }
     next = {

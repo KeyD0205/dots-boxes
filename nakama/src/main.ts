@@ -4,7 +4,17 @@ import { buildHistory, buildRoomRecord, readRoom, writeHistory, writeRoom } from
 import { CreateRoomPayload, JoinRoomPayload, MatchState, OpCode, PresenceRef, SerializedState } from './types';
 
 function json<T>(payload: string): T {
-  return payload ? JSON.parse(payload) as T : {} as T;
+  if (!payload) return {} as T;
+  try {
+    var parsed = JSON.parse(payload);
+    // Handle double-encoding: if the result is a string, parse again
+    if (typeof parsed === 'string') {
+      parsed = JSON.parse(parsed);
+    }
+    return parsed as T;
+  } catch (e) {
+    return {} as T;
+  }
 }
 
 function serialize(state: MatchState): SerializedState {
@@ -124,7 +134,9 @@ function joinRoomRpc(
   nk: nkruntime.Nakama,
   payload: string
 ): string {
+  logger.info('joinRoomRpc payload: ' + payload);
   var body = json<JoinRoomPayload>(payload);
+  logger.info('parsed body roomCode: ' + JSON.stringify(body));
   if (!ctx.userId) {
     throw new Error('Authentication required.');
   }
