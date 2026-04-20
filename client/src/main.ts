@@ -47,13 +47,21 @@ const serverKey = import.meta.env.VITE_NAKAMA_SERVER_KEY || 'defaultkey';
 const client = new Client(serverKey, host, port, useSSL, 3000);
 client.ssl = useSSL;
 
-let session: Session;
-let socket: Socket;
-let currentMatchId: string | null = null;
-let snapshot: Snapshot | null = null;
-let currentUserId: string | null = null;
-let isSpectator = false;
+// Centralized state management
+const state = {
+  session: null as Session | null,
+  socket: null as Socket | null,
+  currentMatchId: null as string | null,
+  snapshot: null as Snapshot | null,
+  currentUserId: null as string | null,
+  isSpectator: false,
+  isConnecting: false,
+  isConnected: false,
+};
+
 const logLines: string[] = [];
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
@@ -128,6 +136,32 @@ function log(message: string) {
   logEl.textContent = logLines.slice(0, 60).join('\n');
 }
 
+function showErrorNotification(message: string) {
+  const notification = document.createElement('div');
+  notification.className = 'notification error';
+  notification.textContent = message;
+  document.body.appendChild(notification);
+  setTimeout(() => notification.remove(), 4000);
+}
+
+function validateRoomCode(code: string): boolean {
+  return /^[A-Z0-9]{6}$/.test(code);
+}
+
+function validateUsername(username: string): boolean {
+  return username.length > 0 && username.length <= 24;
+}
+
+function addErrorHandler(fn: () => Promise<void>, label: string) {
+  return () => {
+    fn().catch((err) => {
+      const msg = `${label} failed: ${String(err)}`;
+      log(msg);
+      showErrorNotification(msg);
+    });
+  };
+}
+
 function getDeviceId() {
   const key = 'dots_boxes_device_id';
   let existing = localStorage.getItem(key);
@@ -143,45 +177,122 @@ function getUsername() {
 }
 
 async function rpc<T>(id: string, body: unknown): Promise<T> {
-  const result = await client.rpc(session, id, JSON.stringify(body));
-  return JSON.parse(result.payload) as T;
+  if (!state.session) throw new Error('Not authenticated');
+  const result = await client.rpc(state.session, id, JSON.stringify(body));
+  
+  // Handle both string and object payloads
+  if (typeof result.payload === 'string') {
+    return JSON.parse(result.payload) as T;
+  } else if (typeof result.payload === 'object' && result.payload !== null) {
+    return result.payload as T;
+  } else {
+    throw new Error(`Invalid RPC response: ${String(result.payload)}`);
+  }
+}
+
+async function disconnect() {
+  state.socket?.close();
+  state.session = null;
+  state.snapshot = null;
+  state.currentMatchId = null;
+  state.isConnected = false;
+  state.isSpectator = false;
+}
+
+function setupSocketHandlers() {
+  if (!state.socket) return;
+
+  state.socket.onmatchdata = (message: any) => {
+    try {
+      const opCode = message.op_code ?? message.opCode;
+      const raw = typeof message.data === 'string' ? message.data : message.state;
+
+      if (!opCode || !raw) {
+        log('Invalid message format');
+        return;
+      }
+
+      if (opCode === OpCode.STATE) {
+        const parsed = JSON.parse(raw);
+        state.snapshot = parsed.snapshot;
+        state.currentMatchId = parsed.matchId;
+        render();
+      } else if (opCode === OpCode.EVENT) {
+        const event = JSON.parse(raw);
+        log(`${event.type}: ${JSON.stringify(event.data)}`);
+      } else if (opCode === OpCode.ERROR) {
+        const event = JSON.parse(raw);
+        log(`Error: ${event.data?.reason || raw}`);
+      }
+    } catch (err) {
+      log(`Message parse error: ${String(err)}`);
+    }
+  };
+
+  state.socket.ondisconnect = async () => {
+    state.isConnected = false;
+    authState.textContent = 'Reconnecting...';
+    log('Socket disconnected. Attempting to reconnect...');
+    
+    await new Promise(r => setTimeout(r, 2000));
+    
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      reconnectAttempts++;
+      try {
+        await connect();
+        reconnectAttempts = 0;
+        if (state.currentMatchId) {
+          await state.socket!.joinMatch(state.currentMatchId);
+          log('Rejoined match after reconnect.');
+        }
+      } catch (err) {
+        log(`Reconnect attempt ${reconnectAttempts} failed: ${String(err)}`);
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+          authState.textContent = 'Reconnection failed';
+          showErrorNotification('Connection lost. Please refresh the page.');
+        }
+      }
+    }
+  };
 }
 
 async function connect() {
-  const username = getUsername();
-  session = await client.authenticateDevice(getDeviceId(), true, username);
-  currentUserId = session.user_id;
-  socket = client.createSocket(useSSL, false);
-  await socket.connect(session, true);
-  socket.onmatchdata = (message: any) => {
-    const raw = typeof message.data === 'string' ? message.data : message.state;
-    if (message.op_code === OpCode.STATE || message.opCode === OpCode.STATE) {
-      const parsed = JSON.parse(raw);
-      snapshot = parsed.snapshot;
-      currentMatchId = parsed.matchId;
-      render();
-    } else if (message.op_code === OpCode.EVENT || message.opCode === OpCode.EVENT) {
-      const event = JSON.parse(raw);
-      log(`${event.type}: ${JSON.stringify(event.data)}`);
-    } else if (message.op_code === OpCode.ERROR || message.opCode === OpCode.ERROR) {
-      const event = JSON.parse(raw);
-      log(`Error: ${event.data?.reason || raw}`);
-    }
-  };
-  socket.ondisconnect = () => {
-    authState.textContent = 'Socket disconnected';
-    log('Socket disconnected. Reconnect and rejoin the room to resume.');
-  };
+  if (state.isConnecting) return;
+  state.isConnecting = true;
 
-  authState.textContent = `Connected as ${username}`;
-  createBtn.disabled = false;
-  joinBtn.disabled = false;
-  spectateBtn.disabled = false;
-  refreshHistoryBtn.disabled = false;
-  log('Authenticated and socket connected.');
+  try {
+    const username = getUsername();
+    if (!validateUsername(username)) {
+      throw new Error('Invalid username');
+    }
+
+    state.session = await client.authenticateDevice(getDeviceId(), true, username);
+    state.currentUserId = state.session.user_id;
+    state.socket = client.createSocket(useSSL, false);
+    await state.socket.connect(state.session, true);
+    
+    setupSocketHandlers();
+    
+    state.isConnected = true;
+    state.isConnecting = false;
+    authState.textContent = `Connected as ${username}`;
+    createBtn.disabled = false;
+    joinBtn.disabled = false;
+    spectateBtn.disabled = false;
+    refreshHistoryBtn.disabled = false;
+    log('Authenticated and socket connected.');
+  } catch (err) {
+    state.isConnecting = false;
+    throw err;
+  }
 }
 
 async function createRoom() {
+  if (!state.isConnected) {
+    showErrorNotification('Not connected. Please connect first.');
+    return;
+  }
+  
   const result = await rpc<{ roomCode: string; matchId: string; snapshot: Snapshot }>('create_room', {
     username: getUsername(),
     gridSize: Number(gridSizeInput.value),
@@ -191,17 +302,26 @@ async function createRoom() {
 }
 
 async function joinRoom(spectator: boolean) {
+  if (!state.isConnected) {
+    showErrorNotification('Not connected. Please connect first.');
+    return;
+  }
+  
   const roomCode = roomCodeInput.value.trim().toUpperCase();
-  if (!roomCode) return;
+  if (!validateRoomCode(roomCode)) {
+    showErrorNotification('Invalid room code. Must be 6 alphanumeric characters.');
+    return;
+  }
+  
   const result = await rpc<{ roomCode: string; matchId: string; snapshot: Snapshot }>('join_room', {
     roomCode,
     username: getUsername(),
     spectator,
   });
-  isSpectator = spectator;
-  currentMatchId = result.matchId;
-  snapshot = result.snapshot;
-  await socket.joinMatch(result.matchId);
+  state.isSpectator = spectator;
+  state.currentMatchId = result.matchId;
+  state.snapshot = result.snapshot;
+  await state.socket!.joinMatch(result.matchId);
   log(`${spectator ? 'Spectating' : 'Joined'} room ${roomCode}.`);
   render();
 }
@@ -226,25 +346,35 @@ function edgeKey(aX: number, aY: number, bX: number, bY: number): string {
 }
 
 async function sendMove(key: string) {
-  if (!socket || !currentMatchId || !snapshot || isSpectator) return;
-  await socket.sendMatchState(currentMatchId, OpCode.MOVE, JSON.stringify({ edgeKey: key }));
+  if (!state.socket || !state.currentMatchId || !state.snapshot || state.isSpectator) return;
+  await state.socket.sendMatchState(state.currentMatchId, OpCode.MOVE, JSON.stringify({ edgeKey: key }));
 }
 
 function playerName(userId: string) {
-  return snapshot?.players.find((p) => p.userId === userId)?.username || userId;
+  return state.snapshot?.players.find((p) => p.userId === userId)?.username || userId;
 }
 
 function colorFor(userId?: string | null) {
-  return snapshot?.players.find((p) => p.userId === userId)?.color || '#64748b';
+  return state.snapshot?.players.find((p) => p.userId === userId)?.color || '#64748b';
+}
+
+function handleBoardClick(e: Event) {
+  const btn = (e.target as HTMLElement).closest('[data-edge]');
+  if (btn?.dataset.edge) {
+    sendMove(btn.dataset.edge).catch((err) => log(String(err)));
+  }
 }
 
 function renderBoard() {
-  if (!snapshot) {
+  // Remove old event listener
+  boardMount.removeEventListener('click', handleBoardClick);
+
+  if (!state.snapshot) {
     boardMount.innerHTML = '<div class="small">Join a room to see the board.</div>';
     return;
   }
 
-  const n = snapshot.gridSize - 1;
+  const n = state.snapshot.gridSize - 1;
   const cells: string[] = [];
   for (let y = 0; y < n; y += 1) {
     for (let x = 0; x < n; x += 1) {
@@ -252,16 +382,16 @@ function renderBoard() {
       const left = edgeKey(x, y, x, y + 1);
       const bottom = edgeKey(x, y + 1, x + 1, y + 1);
       const right = edgeKey(x + 1, y, x + 1, y + 1);
-      const boxOwner = snapshot.boxes[`${x},${y}`];
+      const boxOwner = state.snapshot.boxes[`${x},${y}`];
       const parts = [
         ['t', top],
         ['l', left],
         ['b', bottom],
         ['r', right],
       ].map(([cls, key]) => {
-        const owner = snapshot!.edges[key];
+        const owner = state.snapshot!.edges[key];
         const style = owner ? `style="background:${colorFor(owner)}"` : '';
-        const disabled = Boolean(owner) || snapshot!.status !== 'active' || snapshot!.currentTurnUserId !== currentUserId || isSpectator;
+        const disabled = Boolean(owner) || state.snapshot!.status !== 'active' || state.snapshot!.currentTurnUserId !== state.currentUserId || state.isSpectator;
         return `<button class="edge ${cls}" data-edge="${key}" ${style} ${disabled ? 'disabled' : ''}></button>`;
       }).join('');
 
@@ -276,16 +406,13 @@ function renderBoard() {
   }
 
   boardMount.innerHTML = `<div class="board" style="grid-template-columns: repeat(${n}, 56px)">${cells.join('')}</div>`;
-  boardMount.querySelectorAll<HTMLButtonElement>('[data-edge]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const key = btn.dataset.edge;
-      if (key) sendMove(key).catch((err) => log(String(err)));
-    });
-  });
+  
+  // Add single delegated event listener
+  boardMount.addEventListener('click', handleBoardClick);
 }
 
 function render() {
-  if (!snapshot) {
+  if (!state.snapshot) {
     roomSummary.textContent = 'No room joined yet.';
     scores.innerHTML = '';
     renderBoard();
@@ -294,33 +421,33 @@ function render() {
 
   roomSummary.innerHTML = `
     <div class="row">
-      <span class="badge">Room ${snapshot.roomCode}</span>
-      <span class="badge">Status: ${snapshot.status}</span>
-      <span class="badge">${isSpectator ? 'Spectator' : 'Player'}</span>
-      <span class="badge">Turn: ${snapshot.currentTurnUserId ? playerName(snapshot.currentTurnUserId) : '—'}</span>
+      <span class="badge">Room ${state.snapshot.roomCode}</span>
+      <span class="badge">Status: ${state.snapshot.status}</span>
+      <span class="badge">${state.isSpectator ? 'Spectator' : 'Player'}</span>
+      <span class="badge">Turn: ${state.snapshot.currentTurnUserId ? playerName(state.snapshot.currentTurnUserId) : '—'}</span>
     </div>
-    <p class="small">Players connected: ${snapshot.players.filter((p) => p.isConnected).length}/${snapshot.players.length}. Spectators: ${snapshot.spectators.length}.</p>
+    <p class="small">Players connected: ${state.snapshot.players.filter((p) => p.isConnected).length}/${state.snapshot.players.length}. Spectators: ${state.snapshot.spectators.length}.</p>
   `;
 
-  scores.innerHTML = snapshot.players.map((player) => `
+  scores.innerHTML = state.snapshot.players.map((player) => `
     <div class="score-card">
       <div><strong style="color:${player.color}">${player.username}</strong></div>
-      <div>Score: ${snapshot!.scores[player.userId] ?? 0}</div>
+      <div>Score: ${state.snapshot!.scores[player.userId] ?? 0}</div>
       <div class="small">${player.isConnected ? 'Connected' : 'Disconnected'}</div>
     </div>
   `).join('');
 
-  if (snapshot.status === 'finished') {
-    const winners = snapshot.winnerIds.map((id) => playerName(id)).join(', ');
-    log(`Game finished. Winner${snapshot.winnerIds.length > 1 ? 's' : ''}: ${winners}`);
+  if (state.snapshot.status === 'finished') {
+    const winners = state.snapshot.winnerIds.map((id) => playerName(id)).join(', ');
+    log(`Game finished. Winner${state.snapshot.winnerIds.length > 1 ? 's' : ''}: ${winners}`);
   }
 
   renderBoard();
 }
 
-connectBtn.addEventListener('click', () => connect().catch((err) => log(`Connect failed: ${String(err)}`)));
-createBtn.addEventListener('click', () => createRoom().catch((err) => log(`Create failed: ${String(err)}`)));
-joinBtn.addEventListener('click', () => joinRoom(false).catch((err) => log(`Join failed: ${String(err)}`)));
-spectateBtn.addEventListener('click', () => joinRoom(true).catch((err) => log(`Spectate failed: ${String(err)}`)));
-refreshHistoryBtn.addEventListener('click', () => refreshHistory().catch((err) => log(`History failed: ${String(err)}`)));
+connectBtn.addEventListener('click', addErrorHandler(connect, 'Connect'));
+createBtn.addEventListener('click', addErrorHandler(createRoom, 'Create room'));
+joinBtn.addEventListener('click', addErrorHandler(() => joinRoom(false), 'Join room'));
+spectateBtn.addEventListener('click', addErrorHandler(() => joinRoom(true), 'Spectate'));
+refreshHistoryBtn.addEventListener('click', addErrorHandler(refreshHistory, 'Refresh history'));
 render();
