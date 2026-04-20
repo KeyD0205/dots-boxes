@@ -167,7 +167,7 @@ This yields **single-writer semantics** per match while still allowing crash rec
 
 ## Data model
 
-This implementation uses **Nakama storage collections** backed by PostgreSQL rather than custom SQL tables. Heroic Labs recommends using the built-in storage engine instead of custom SQL for project data, and storage objects are persisted as JSONB in PostgreSQL. citeturn495338view3turn616483view1
+This implementation uses **Nakama storage collections** backed by PostgreSQL rather than custom SQL tables. Heroic Labs recommends using the built-in storage engine instead of custom SQL for project data, and storage objects are persisted as JSONB in PostgreSQL.
 
 ### `room` collection
 
@@ -221,6 +221,37 @@ Written when the game ends.
 
 ---
 
+## Database migrations
+
+This project uses **Nakama's built-in storage engine** backed by PostgreSQL, which stores all game data as JSONB documents (room snapshots, match history). No custom schema migrations or raw SQL scripts are needed.
+
+### Versioning your data model
+
+If you extend the storage schema in the future:
+
+1. **Add a version field** to your data structure:
+   ```json
+   {
+     "version": 1,
+     "roomCode": "ABCD12",
+     ...
+   }
+   ```
+
+2. **On read, check the version** and migrate old formats to new ones in application code:
+   ```typescript
+   const room = readRoom(nk, roomCode);
+   if (!room.version) {
+     // Migrate from v0 to v1
+     room.version = 1;
+     room.newField = getDefaultValue();
+   }
+   ```
+
+3. **Never use raw SQL**; always use the Nakama storage API for consistency and multi-tenant safety.
+
+---
+
 ## Disconnection and reconnection
 
 When a player disconnects:
@@ -256,7 +287,7 @@ This implementation does **not** auto-forfeit by default. A room can continue wh
 - Add a storage index or external analytics pipeline for large-scale history queries.
 - Use Redis or message bus only if cross-service fan-out or analytics ingestion requires it.
 
-Nakama’s authoritative match model keeps a given match on one node for consistency. citeturn396969search2turn495338view0
+Nakama’s authoritative match model keeps a given match on one node for consistency.
 
 ---
 
@@ -320,7 +351,7 @@ These tests cover:
 - bonus turns
 - game completion and winner calculation
 
-The Jest approach for TypeScript runtime testing follows the official Heroic Labs guidance. citeturn495338view2
+The Jest approach for TypeScript runtime testing follows the official Heroic Labs guidance.
 
 ---
 
@@ -328,7 +359,7 @@ The Jest approach for TypeScript runtime testing follows the official Heroic Lab
 
 ### Why Nakama storage instead of custom SQL tables?
 
-Nakama’s storage engine is already backed by PostgreSQL and is designed for project data. Heroic Labs explicitly discourages custom SQL tables unless necessary. citeturn495338view3
+Nakama’s storage engine is already backed by PostgreSQL and is designed for project data. Heroic Labs explicitly discourages custom SQL tables unless necessary.
 
 ### Why snapshot every move?
 
@@ -355,6 +386,6 @@ It is simpler and more interview-friendly than ranking or queue-based matchmakin
 
 ## Notes on the official docs used
 
-- Nakama authoritative matches are registered and created via the TypeScript runtime. citeturn495338view0turn616483view3
-- Nakama recommends Docker Compose for local installation. citeturn495338view1
-- Nakama storage objects are JSON-backed and written through `storageWrite`. citeturn495338view3turn616483view1
+- Nakama authoritative matches are registered and created via the TypeScript runtime.
+- Nakama recommends Docker Compose for local installation.
+- Nakama storage objects are JSON-backed and written through `storageWrite`.
