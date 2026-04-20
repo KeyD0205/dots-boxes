@@ -1,72 +1,25 @@
-// --- Utility stubs for missing functions ---
-function randomRoomCode(): string {
-  // Simple random 6-letter code
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
-}
-
-function ensureRuntimeMatch(nk: nkruntime.Nakama, logger: nkruntime.Logger, roomCode: string): any {
-  // Try to find the room in storage
-  const room = readRoom(nk, logger, roomCode);
-  logger.info('[ensureRuntimeMatch] Lookup for roomCode=%s, found=%s', roomCode, !!room);
-  if (room && room.matchId) {
-    // Check if the match is running
-    const match = nk.matchGet(room.matchId);
-    logger.info('[ensureRuntimeMatch] matchId=%s, match running=%s', room.matchId, !!match);
-    if (match) {
-      return { room, matchId: room.matchId };
-    } else if (room.snapshot) {
-      // Recreate the match from the snapshot
-      const recreatedMatchId = nk.matchCreate('dots_boxes', { roomCode: roomCode, snapshot: room.snapshot });
-      const updated = {
-        ...room,
-        matchId: recreatedMatchId,
-        updatedAt: new Date().toISOString(),
-      };
-      writeRoom(nk, logger, updated);
-      logger.info('[ensureRuntimeMatch] Recovered room %s into new match %s', roomCode, recreatedMatchId);
-      return { room: updated, matchId: recreatedMatchId };
-    }
-  }
-
-  // If not found, try to recover from snapshot if possible
-  if (room && room.snapshot) {
-    const recreatedMatchId = nk.matchCreate('dots_boxes', { roomCode: roomCode, snapshot: room.snapshot });
-    const updated = {
-      ...room,
-      matchId: recreatedMatchId,
-      updatedAt: new Date().toISOString(),
-    };
-    writeRoom(nk, logger, updated);
-    logger.info('[ensureRuntimeMatch] Recovered room %s into new match %s (no matchId)', roomCode, recreatedMatchId);
-    return { room: updated, matchId: recreatedMatchId };
-  }
-
-  logger.warn('[ensureRuntimeMatch] Room not found for code=%s', roomCode);
-  throw new Error('Room not found');
-}
-
-function eventPayload(type: string, data: any): any {
-  return { type, ...data };
-}
 /// <reference path="../node_modules/nakama-runtime/index.d.ts" />
+
 import { addPlayer, applyMove, createInitialSnapshot, markDisconnected, normalizeGridSize, startIfReady } from './game';
 import { buildHistory, buildRoomRecord, readRoom, writeHistory, writeRoom } from './storage';
 import { CreateRoomPayload, JoinRoomPayload, MatchState, OpCode, PresenceRef, SerializedState } from './types';
+
+function randomRoomCode(): string {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
 
 function json<T>(payload: string): T {
   if (!payload) return {} as T;
   try {
     var parsed = JSON.parse(payload);
-    // Handle double-encoding: if the result is a string, parse again
     if (typeof parsed === 'string') {
       parsed = JSON.parse(parsed);
     }
     return parsed as T;
-  } catch (e) {
+  } catch (_e) {
     return {} as T;
   }
 }
-
 
 function serialize(state: MatchState): SerializedState {
   return {
@@ -88,7 +41,86 @@ function serialize(state: MatchState): SerializedState {
   };
 }
 
+function eventPayload(type: string, data: any): any {
+  return {
+    type: type,
+    data: data,
+  };
+}
 
+function statePayload(state: MatchState): any {
+  return {
+    matchId: state.matchId,
+    snapshot: serialize(state),
+  };
+}
+
+function decodeMessageData(data: any): string {
+  if (typeof data === 'string') {
+    return data;
+  }
+
+  if (data && typeof data.length === 'number') {
+    var out = '';
+    for (var i = 0; i < data.length; i += 1) {
+      out += String.fromCharCode(data[i]);
+    }
+    return out;
+  }
+
+  if (data && data.buffer && typeof data.byteLength === 'number') {
+    var bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+    var out2 = '';
+    for (var j = 0; j < bytes.length; j += 1) {
+      out2 += String.fromCharCode(bytes[j]);
+    }
+    return out2;
+  }
+
+  return String(data || '');
+}
+
+function ensureRuntimeMatch(nk: nkruntime.Nakama, logger: nkruntime.Logger, roomCode: string): any {
+  var room = readRoom(nk, logger, roomCode);
+  logger.info('[ensureRuntimeMatch] Lookup for roomCode=%s, found=%s', roomCode, !!room);
+
+  if (!room) {
+    logger.warn('[ensureRuntimeMatch] Room not found for code=%s', roomCode);
+    throw new Error('Room not found');
+  }
+
+  if (room.matchId) {
+    try {
+      var running = nk.matchGet(room.matchId);
+      logger.info('[ensureRuntimeMatch] matchId=%s, match running=%s', room.matchId, !!running);
+      if (running) {
+        return { room: room, matchId: room.matchId };
+      }
+    } catch (_e) {
+      // fall through to recovery
+    }
+  }
+
+  if (room.snapshot) {
+    var recreatedMatchId = nk.matchCreate('dots_boxes', {
+      roomCode: roomCode,
+      snapshot: room.snapshot,
+    });
+
+    var updated = {
+      ...room,
+      matchId: recreatedMatchId,
+      updatedAt: new Date().toISOString(),
+    };
+
+    writeRoom(nk, logger, updated);
+    logger.info('[ensureRuntimeMatch] Recovered room %s into new match %s', roomCode, recreatedMatchId);
+    return { room: updated, matchId: recreatedMatchId };
+  }
+
+  logger.warn('[ensureRuntimeMatch] Room exists but has no snapshot for code=%s', roomCode);
+  throw new Error('Room not recoverable');
+}
 
 function createRoomRpc(
   ctx: nkruntime.Context,
@@ -97,6 +129,7 @@ function createRoomRpc(
   payload: string
 ): string {
   var body = json<CreateRoomPayload>(payload);
+
   if (!ctx.userId) {
     throw new Error('Authentication required.');
   }
@@ -109,14 +142,26 @@ function createRoomRpc(
     roomCode = randomRoomCode();
   }
 
-  var snapshot = createInitialSnapshot(roomCode, gridSize, { userId: ctx.userId, username: username });
-  var matchId = nk.matchCreate('dots_boxes', { roomCode: roomCode, snapshot: snapshot });
-  var room = buildRoomRecord(snapshot, matchId, ctx.userId);
+  var snapshot = createInitialSnapshot(roomCode, gridSize, {
+    userId: ctx.userId,
+    username: username,
+  });
 
+  var matchId = nk.matchCreate('dots_boxes', {
+    roomCode: roomCode,
+    snapshot: snapshot,
+  });
+
+  var room = buildRoomRecord(snapshot, matchId, ctx.userId);
   writeRoom(nk, logger, room);
+
   logger.info('Created room %s match %s', roomCode, matchId);
 
-  return JSON.stringify({ roomCode: roomCode, matchId: matchId, snapshot: snapshot });
+  return JSON.stringify({
+    roomCode: roomCode,
+    matchId: matchId,
+    snapshot: snapshot,
+  });
 }
 
 function joinRoomRpc(
@@ -125,9 +170,8 @@ function joinRoomRpc(
   nk: nkruntime.Nakama,
   payload: string
 ): string {
-  logger.info('joinRoomRpc payload: ' + payload);
   var body = json<JoinRoomPayload>(payload);
-  logger.info('parsed body roomCode: ' + JSON.stringify(body));
+
   if (!ctx.userId) {
     throw new Error('Authentication required.');
   }
@@ -143,6 +187,7 @@ function joinRoomRpc(
   var username = (body.username && body.username.trim()) || ctx.username || ('Player-' + ctx.userId.slice(0, 6));
 
   var snapshot = room.snapshot as SerializedState;
+
   if (!body.spectator && snapshot.status !== 'finished') {
     snapshot = addPlayer(snapshot, ctx.userId, username);
     snapshot = startIfReady(snapshot);
@@ -167,11 +212,13 @@ function getRoomRpc(
 ): string {
   var body = json<{ roomCode: string }>(payload);
   var roomCode = body.roomCode ? body.roomCode.trim().toUpperCase() : '';
+
   if (!roomCode) {
     throw new Error('roomCode is required.');
   }
 
   var ensured = ensureRuntimeMatch(nk, logger, roomCode);
+
   return JSON.stringify({
     roomCode: roomCode,
     matchId: ensured.matchId,
@@ -187,6 +234,7 @@ function listHistoryRpc(
 ): string {
   var records = (nk as any).storageList('00000000-0000-0000-0000-000000000000', 'match_history', 50, '', '');
   var objects = (records && records.objects) ? records.objects : [];
+
   return JSON.stringify({
     items: objects.map(function (o: any) { return o.value; }),
   });
@@ -242,6 +290,7 @@ function matchJoinAttempt(
 ) {
   var spectator = Boolean(metadata && metadata.spectator);
   var isExistingPlayer = false;
+
   for (var i = 0; i < state.players.length; i += 1) {
     if (state.players[i].userId === presence.userId) {
       isExistingPlayer = true;
@@ -258,7 +307,7 @@ function matchJoinAttempt(
 
 function matchJoin(
   ctx: nkruntime.Context,
-  _logger: nkruntime.Logger,
+  logger: nkruntime.Logger,
   nk: nkruntime.Nakama,
   dispatcher: nkruntime.MatchDispatcher,
   _tick: number,
@@ -266,6 +315,11 @@ function matchJoin(
   presences: nkruntime.Presence[]
 ) {
   state.matchId = state.matchId || ctx.matchId || '';
+
+  var persistedRoom = readRoom(nk, logger, state.roomCode);
+  if (persistedRoom && persistedRoom.snapshot) {
+    Object.assign(state, persistedRoom.snapshot);
+  }
 
   for (var p = 0; p < presences.length; p += 1) {
     var presence = presences[p];
@@ -283,7 +337,7 @@ function matchJoin(
       existingPlayer.isConnected = true;
       existingPlayer.username = presence.username || existingPlayer.username;
     } else {
-      var spectator: PresenceRef = {
+      var spectatorSeat: PresenceRef = {
         userId: presence.userId,
         sessionId: presence.sessionId,
         username: presence.username,
@@ -296,24 +350,47 @@ function matchJoin(
           filteredSpectators.push(state.spectators[s]);
         }
       }
-      filteredSpectators.push(spectator);
+      filteredSpectators.push(spectatorSeat);
       state.spectators = filteredSpectators;
     }
   }
 
-  writeRoom(nk, _logger, buildRoomRecord(serialize(state), state.matchId, state.players.length ? state.players[0].userId : ''));
+  writeRoom(
+    nk,
+    logger,
+    buildRoomRecord(
+      serialize(state),
+      state.matchId,
+      state.players.length ? state.players[0].userId : ''
+    )
+  );
 
-  dispatcher.broadcastMessage(OpCode.STATE, JSON.stringify(statePayload(state)), presences, null, true);
-  dispatcher.broadcastMessage(OpCode.EVENT, JSON.stringify(eventPayload('presence_joined', {
-    userIds: presences.map(function (presence) { return presence.userId; }),
-  })), presences, null, true);
+  dispatcher.broadcastMessage(
+    OpCode.STATE,
+    JSON.stringify(statePayload(state)),
+    null,
+    null,
+    true
+  );
+
+  dispatcher.broadcastMessage(
+    OpCode.EVENT,
+    JSON.stringify(
+      eventPayload('presence_joined', {
+        userIds: presences.map(function (presence) { return presence.userId; }),
+      })
+    ),
+    null,
+    null,
+    true
+  );
 
   return { state: state };
 }
 
 function matchLeave(
   _ctx: nkruntime.Context,
-  _logger: nkruntime.Logger,
+  logger: nkruntime.Logger,
   nk: nkruntime.Nakama,
   dispatcher: nkruntime.MatchDispatcher,
   _tick: number,
@@ -327,12 +404,35 @@ function matchLeave(
     Object.assign(state, updated);
   }
 
-  writeRoom(nk, _logger, buildRoomRecord(serialize(state), state.matchId, state.players.length ? state.players[0].userId : ''));
+  writeRoom(
+    nk,
+    logger,
+    buildRoomRecord(
+      serialize(state),
+      state.matchId,
+      state.players.length ? state.players[0].userId : ''
+    )
+  );
 
-  dispatcher.broadcastMessage(OpCode.EVENT, JSON.stringify(eventPayload('presence_left', {
-    userIds: presences.map(function (presence) { return presence.userId; }),
-  })), presences, null, true);
-  dispatcher.broadcastMessage(OpCode.STATE, JSON.stringify(statePayload(state)), presences, null, true);
+  dispatcher.broadcastMessage(
+    OpCode.EVENT,
+    JSON.stringify(
+      eventPayload('presence_left', {
+        userIds: presences.map(function (presence) { return presence.userId; }),
+      })
+    ),
+    null,
+    null,
+    true
+  );
+
+  dispatcher.broadcastMessage(
+    OpCode.STATE,
+    JSON.stringify(statePayload(state)),
+    null,
+    null,
+    true
+  );
 
   return { state: state };
 }
@@ -353,8 +453,11 @@ function matchLoop(
     }
 
     var payload: { edgeKey: string };
+
     try {
-      payload = JSON.parse(typeof message.data === 'string' ? message.data : new TextDecoder().decode(message.data));
+      var raw = decodeMessageData(message.data);
+      logger.info('Decoded move payload: %s', raw);
+      payload = JSON.parse(raw);
     } catch (_err) {
       dispatcher.broadcastMessage(
         OpCode.ERROR,
@@ -365,12 +468,14 @@ function matchLoop(
     }
 
     var result = applyMove(serialize(state), message.sender.userId, payload.edgeKey);
+
     if (result.error) {
       dispatcher.broadcastMessage(
         OpCode.ERROR,
         JSON.stringify(eventPayload('move_rejected', { reason: result.error })),
         [message.sender]
       );
+      logger.warn('Move rejected: %s (user: %s, edge: %s)', result.error, message.sender.userId, payload.edgeKey);
       continue;
     }
 
@@ -378,21 +483,55 @@ function matchLoop(
 
     logger.info('Room %s accepted move %s from %s', state.roomCode, payload.edgeKey, message.sender.userId);
 
-    writeRoom(nk, logger, buildRoomRecord(serialize(state), state.matchId, state.players.length ? state.players[0].userId : ''));
+    writeRoom(
+      nk,
+      logger,
+      buildRoomRecord(
+        serialize(state),
+        state.matchId,
+        state.players.length ? state.players[0].userId : ''
+      )
+    );
 
-    dispatcher.broadcastMessage(OpCode.STATE, JSON.stringify(statePayload(state)), null, null, true);
-    dispatcher.broadcastMessage(OpCode.EVENT, JSON.stringify(eventPayload('move_accepted', {
-      playerId: message.sender.userId,
-      edgeKey: payload.edgeKey,
-      completedBoxes: result.completedBoxes,
-    })), null, null, true);
+    dispatcher.broadcastMessage(
+      OpCode.STATE,
+      JSON.stringify(statePayload(state)),
+      null,
+      null,
+      true
+    );
+
+    dispatcher.broadcastMessage(
+      OpCode.EVENT,
+      JSON.stringify(
+        eventPayload('move_accepted', {
+          playerId: message.sender.userId,
+          edgeKey: payload.edgeKey,
+          completedBoxes: result.completedBoxes,
+        })
+      ),
+      null,
+      null,
+      true
+    );
 
     if (state.status === 'finished' && state.finishedAt) {
       writeHistory(nk, logger, buildHistory(serialize(state)));
-      dispatcher.broadcastMessage(OpCode.EVENT, JSON.stringify(eventPayload('game_finished', {
-        winnerIds: state.winnerIds,
-        scores: state.scores,
-      })), null, null, true);
+
+      dispatcher.broadcastMessage(
+        OpCode.EVENT,
+        JSON.stringify(
+          eventPayload('game_finished', {
+            winnerIds: state.winnerIds,
+            scores: state.scores,
+          })
+        ),
+        null,
+        null,
+        true
+      );
+
+      logger.info('Room %s transitioned to FINISHED state.', state.roomCode);
     }
   }
 
@@ -401,15 +540,31 @@ function matchLoop(
 
 function matchTerminate(
   _ctx: nkruntime.Context,
-  _logger: nkruntime.Logger,
+  logger: nkruntime.Logger,
   nk: nkruntime.Nakama,
   dispatcher: nkruntime.MatchDispatcher,
   _tick: number,
   state: MatchState,
   _graceSeconds: number
 ) {
-  writeRoom(nk, _logger, buildRoomRecord(serialize(state), state.matchId, state.players.length ? state.players[0].userId : ''));
-  dispatcher.broadcastMessage(OpCode.EVENT, JSON.stringify(eventPayload('match_terminating', { roomCode: state.roomCode })), null, null, true);
+  writeRoom(
+    nk,
+    logger,
+    buildRoomRecord(
+      serialize(state),
+      state.matchId,
+      state.players.length ? state.players[0].userId : ''
+    )
+  );
+
+  dispatcher.broadcastMessage(
+    OpCode.EVENT,
+    JSON.stringify(eventPayload('match_terminating', { roomCode: state.roomCode })),
+    null,
+    null,
+    true
+  );
+
   return { state: state };
 }
 
@@ -450,8 +605,3 @@ function InitModule(
 }
 
 !InitModule && InitModule.bind(null);
-
-function statePayload(state: MatchState): any {
-  // Return the serializable state for clients
-  return serialize(state);
-}
