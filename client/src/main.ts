@@ -38,7 +38,20 @@ type HistoryEntry = {
   players: Array<{ userId: string; username: string; color: string }>;
 };
 
-const OpCode = { STATE: 101, MOVE: 102, ERROR: 103, EVENT: 104 };
+type RoomRpcResult = {
+  roomCode: string;
+  matchId: string;
+  snapshot: Snapshot;
+  spectator?: boolean;
+};
+
+const OpCode = {
+  STATE: 101,
+  MOVE: 102,
+  ERROR: 103,
+  EVENT: 104,
+};
+
 const host = import.meta.env.VITE_NAKAMA_HOST || window.location.hostname;
 const port = Number(import.meta.env.VITE_NAKAMA_PORT || '7350');
 const useSSL = (import.meta.env.VITE_NAKAMA_SCHEME || 'http') === 'https';
@@ -47,7 +60,12 @@ const serverKey = import.meta.env.VITE_NAKAMA_SERVER_KEY || 'defaultkey';
 const client = new Client(serverKey, host, port, useSSL, 3000);
 client.ssl = useSSL;
 
-// Centralized state management
+const SESSION_KEY = 'nakamaSession';
+const DEVICE_KEY = 'dots_boxes_device_id';
+const ROOM_KEY = 'dots_boxes_room';
+const SPECTATOR_KEY = 'dots_boxes_spectator';
+const MAX_RECONNECT_ATTEMPTS = 5;
+
 const state = {
   session: null as Session | null,
   socket: null as Socket | null,
@@ -57,43 +75,18 @@ const state = {
   isSpectator: false,
   isConnecting: false,
   isConnected: false,
+  reconnectAttempts: 0,
+  reconnectInFlight: false,
+  lastFinishedAtLogged: null as string | null,
 };
 
-// --- Session Persistence ---
-const SESSION_KEY = 'nakamaSession';
-
-function saveSession(session: Session) {
-  localStorage.setItem(SESSION_KEY, JSON.stringify({ token: session.token, refresh_token: session.refresh_token }));
-}
-
-function loadSession(): Session | null {
-  const str = localStorage.getItem(SESSION_KEY);
-  if (!str) return null;
-  try {
-    const obj = JSON.parse(str);
-    if (obj && obj.token) {
-      const session = Session.restore(obj.token, obj.refresh_token);
-      if (!session.isexpired(Date.now() / 1000)) {
-        return session;
-      }
-    }
-  } catch {}
-  clearSession();
-  return null;
-}
-
-function clearSession() {
-  localStorage.removeItem(SESSION_KEY);
-}
-
 const logLines: string[] = [];
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
   <div class="app">
     <h1>Dots and Boxes</h1>
+
     <div class="panel">
       <div class="row">
         <input id="username" placeholder="Username" maxlength="24" />
@@ -163,20 +156,10 @@ function log(message: string) {
   logEl.textContent = logLines.slice(0, 60).join('\n');
 }
 
-function extractErrorMessage(err: any): string {
-  // Handle Response objects from Nakama client
-  if (err instanceof Response) {
-    return `HTTP ${err.status}: ${err.statusText}`;
-  }
-  // Handle error objects
-  if (err instanceof Error) {
-    return err.message;
-  }
-  // Handle objects with message property
-  if (typeof err === 'object' && err !== null && 'message' in err) {
-    return String(err.message);
-  }
-  // Fallback
+function extractErrorMessage(err: unknown): string {
+  if (err instanceof Response) return `HTTP ${err.status}: ${err.statusText}`;
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'object' && err !== null && 'message' in err) return String((err as any).message);
   return String(err);
 }
 
@@ -206,49 +189,156 @@ function addErrorHandler(fn: () => Promise<void>, label: string) {
   };
 }
 
-function getDeviceId() {
-  const key = 'dots_boxes_device_id';
-  let existing = localStorage.getItem(key);
+function saveSession(session: Session) {
+  localStorage.setItem(
+    SESSION_KEY,
+    JSON.stringify({
+      token: session.token,
+      refresh_token: session.refresh_token,
+    })
+  );
+}
+
+function loadSession(): Session | null {
+  const raw = localStorage.getItem(SESSION_KEY);
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed?.token) return null;
+
+    const restored = Session.restore(parsed.token, parsed.refresh_token);
+    if (!restored.isexpired(Date.now() / 1000)) {
+      return restored;
+    }
+  } catch {
+    // ignore
+  }
+
+  clearSession();
+  return null;
+}
+
+function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
+}
+
+function saveRoomState(roomCode: string, spectator: boolean) {
+  localStorage.setItem(ROOM_KEY, roomCode);
+  localStorage.setItem(SPECTATOR_KEY, spectator ? '1' : '0');
+}
+
+function loadRoomState(): { roomCode: string; spectator: boolean } | null {
+  const roomCode = localStorage.getItem(ROOM_KEY);
+  if (!roomCode) return null;
+
+  return {
+    roomCode: roomCode,
+    spectator: localStorage.getItem(SPECTATOR_KEY) === '1',
+  };
+}
+
+function clearRoomState() {
+  localStorage.removeItem(ROOM_KEY);
+  localStorage.removeItem(SPECTATOR_KEY);
+}
+
+function getDeviceId(): string {
+  let existing = localStorage.getItem(DEVICE_KEY);
   if (!existing) {
     existing = `${crypto.randomUUID()}-${Date.now()}`;
-    localStorage.setItem(key, existing);
+    localStorage.setItem(DEVICE_KEY, existing);
   }
   return existing;
 }
 
-function getUsername() {
+function getUsername(): string {
   return usernameInput.value.trim() || `Player-${getDeviceId().slice(0, 6)}`;
+}
+
+function getCurrentRoomCode(): string | null {
+  if (state.snapshot?.roomCode) return state.snapshot.roomCode;
+  const room = loadRoomState();
+  if (room?.roomCode) return room.roomCode;
+  const raw = roomCodeInput.value.trim().toUpperCase();
+  return raw || null;
+}
+
+function setConnectedUi(connected: boolean, username?: string) {
+  createBtn.disabled = !connected;
+  joinBtn.disabled = !connected;
+  spectateBtn.disabled = !connected;
+  refreshHistoryBtn.disabled = !connected;
+  authState.textContent = connected ? `Connected as ${username ?? 'user'}` : 'Disconnected';
+}
+
+function resetGameState() {
+  state.snapshot = null;
+  state.currentMatchId = null;
+  state.isSpectator = false;
+  state.lastFinishedAtLogged = null;
+}
+
+function decodeMatchPayload(message: any): string {
+  if (typeof message?.data === 'string') {
+    return message.data;
+  }
+
+  if (message?.data instanceof Uint8Array) {
+    return new TextDecoder().decode(message.data);
+  }
+
+  if (ArrayBuffer.isView(message?.data)) {
+    const view = message.data;
+    return new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+  }
+
+  if (message?.data instanceof ArrayBuffer) {
+    return new TextDecoder().decode(new Uint8Array(message.data));
+  }
+
+  if (typeof message?.state === 'string') {
+    return message.state;
+  }
+
+  return '';
 }
 
 async function rpc<T>(id: string, body: unknown): Promise<T> {
   if (!state.session) throw new Error('Not authenticated');
-  
-  try {
-    const result = await client.rpc(state.session, id, JSON.stringify(body));
-    log(`RPC ${id} response: payload type = ${typeof result.payload}`);
-    
-    // Handle both string and object payloads
-    if (typeof result.payload === 'string') {
-      return JSON.parse(result.payload) as T;
-    } else if (typeof result.payload === 'object' && result.payload !== null) {
-      return result.payload as T;
-    } else {
-      throw new Error(`Invalid RPC response: ${String(result.payload)}`);
-    }
-  } catch (err) {
-    log(`RPC ${id} error: ${extractErrorMessage(err)}`);
-    throw err;
+
+  const result = await client.rpc(state.session, id, JSON.stringify(body));
+
+  if (typeof result.payload === 'string') {
+    return JSON.parse(result.payload) as T;
   }
+
+  if (typeof result.payload === 'object' && result.payload !== null) {
+    return result.payload as T;
+  }
+
+  throw new Error(`Invalid RPC response for ${id}`);
 }
 
 async function disconnect() {
-  state.socket?.disconnect(true);
+  try {
+    state.socket?.disconnect(true);
+  } catch {
+    // ignore
+  }
+
+  state.socket = null;
   state.session = null;
-  state.snapshot = null;
-  state.currentMatchId = null;
+  state.currentUserId = null;
   state.isConnected = false;
-  state.isSpectator = false;
-  clearSessionToken();
+  state.isConnecting = false;
+  state.reconnectAttempts = 0;
+  state.reconnectInFlight = false;
+  resetGameState();
+  clearSession();
+  clearRoomState();
+  setConnectedUi(false);
+  render();
 }
 
 function setupSocketHandlers() {
@@ -257,9 +347,10 @@ function setupSocketHandlers() {
   state.socket.onmatchdata = (message: any) => {
     try {
       const opCode = message.op_code ?? message.opCode;
-      const raw = typeof message.data === 'string' ? message.data : message.state;
+      const raw = decodeMatchPayload(message);
 
-      if (!opCode || !raw) {
+      if (opCode == null || !raw) {
+        console.log('Invalid match message:', message, message?.data, message?.data?.constructor?.name);
         log('Invalid message format');
         return;
       }
@@ -268,44 +359,100 @@ function setupSocketHandlers() {
         const parsed = JSON.parse(raw);
         state.snapshot = parsed.snapshot;
         state.currentMatchId = parsed.matchId;
+        if (parsed.snapshot?.roomCode) {
+          roomCodeInput.value = parsed.snapshot.roomCode;
+          saveRoomState(parsed.snapshot.roomCode, state.isSpectator);
+        }
         render();
-      } else if (opCode === OpCode.EVENT) {
+        return;
+      }
+
+      if (opCode === OpCode.EVENT) {
         const event = JSON.parse(raw);
         log(`${event.type}: ${JSON.stringify(event.data)}`);
-      } else if (opCode === OpCode.ERROR) {
+        return;
+      }
+
+      if (opCode === OpCode.ERROR) {
         const event = JSON.parse(raw);
-        log(`Error: ${event.data?.reason || raw}`);
+        const msg = event.data?.reason || raw;
+        log(`Error: ${msg}`);
+        showErrorNotification(String(msg));
       }
     } catch (err) {
-      log(`Message parse error: ${String(err)}`);
+      console.error('Match message parse failure:', err, message);
+      log(`Message parse error: ${extractErrorMessage(err)}`);
     }
   };
 
-  state.socket.ondisconnect = async () => {
+  state.socket.ondisconnect = () => {
     state.isConnected = false;
-    authState.textContent = 'Reconnecting...';
-    log('Socket disconnected. Attempting to reconnect...');
-    
-    await new Promise(r => setTimeout(r, 2000));
-    
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      reconnectAttempts++;
-      try {
-        await connect();
-        reconnectAttempts = 0;
-        if (state.currentMatchId) {
-          await state.socket!.joinMatch(state.currentMatchId);
-          log('Rejoined match after reconnect.');
-        }
-      } catch (err) {
-        log(`Reconnect attempt ${reconnectAttempts} failed: ${extractErrorMessage(err)}`);
-        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          authState.textContent = 'Reconnection failed';
-          showErrorNotification('Connection lost. Please refresh the page.');
-        }
-      }
-    }
+    log('Socket disconnected.');
+    reconnectFlow().catch((err) => {
+      log(`Reconnect flow failed: ${extractErrorMessage(err)}`);
+    });
   };
+}
+
+async function ensureSocketConnected() {
+  if (!state.session) throw new Error('No session');
+
+  if (state.socket) {
+    try {
+      state.socket.disconnect(true);
+    } catch {
+      // ignore
+    }
+  }
+
+  state.socket = client.createSocket(useSSL, false);
+  setupSocketHandlers();
+  await state.socket.connect(state.session, true);
+  state.isConnected = true;
+}
+
+async function rejoinSavedRoom() {
+  const restoredRoom = loadRoomState();
+  if (!restoredRoom || !state.socket) return;
+
+  const room = await rpc<RoomRpcResult>('get_room', { roomCode: restoredRoom.roomCode });
+  state.currentMatchId = room.matchId;
+  state.snapshot = room.snapshot;
+  state.isSpectator = restoredRoom.spectator;
+  roomCodeInput.value = room.roomCode;
+  await state.socket.joinMatch(room.matchId);
+  render();
+  log(`Restored room ${room.roomCode}.`);
+}
+
+async function reconnectFlow() {
+  if (state.reconnectInFlight) return;
+  if (!state.session) return;
+
+  state.reconnectInFlight = true;
+  authState.textContent = 'Reconnecting...';
+
+  while (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    state.reconnectAttempts += 1;
+
+    try {
+      await new Promise((r) => setTimeout(r, 1500));
+      await ensureSocketConnected();
+      await rejoinSavedRoom();
+
+      state.reconnectAttempts = 0;
+      state.reconnectInFlight = false;
+      authState.textContent = `Connected as ${getUsername()}`;
+      render();
+      return;
+    } catch (err) {
+      log(`Reconnect attempt ${state.reconnectAttempts} failed: ${extractErrorMessage(err)}`);
+    }
+  }
+
+  state.reconnectInFlight = false;
+  authState.textContent = 'Reconnection failed';
+  showErrorNotification('Connection lost. Please refresh and reconnect.');
 }
 
 async function connect() {
@@ -318,9 +465,7 @@ async function connect() {
       throw new Error('Invalid username');
     }
 
-
-    // Try to restore session from localStorage
-    let session: Session | null = loadSession();
+    let session = loadSession();
     if (!session) {
       session = await client.authenticateDevice(getDeviceId(), true, username);
       saveSession(session);
@@ -328,19 +473,23 @@ async function connect() {
 
     state.session = session;
     state.currentUserId = session.user_id;
-    state.socket = client.createSocket(useSSL, false);
-    await state.socket.connect(session, true);
 
-    setupSocketHandlers();
+    await ensureSocketConnected();
 
-    state.isConnected = true;
+    state.reconnectAttempts = 0;
     state.isConnecting = false;
-    authState.textContent = `Connected as ${username}`;
-    createBtn.disabled = false;
-    joinBtn.disabled = false;
-    spectateBtn.disabled = false;
-    refreshHistoryBtn.disabled = false;
+    setConnectedUi(true, username);
     log('Authenticated and socket connected.');
+
+    if (!state.snapshot) {
+      try {
+        await rejoinSavedRoom();
+      } catch (err) {
+        log(`Room restore skipped: ${extractErrorMessage(err)}`);
+      }
+    }
+
+    render();
   } catch (err) {
     state.isConnecting = false;
     throw err;
@@ -353,100 +502,116 @@ async function createRoom() {
     return;
   }
 
-  log('Creating room...');
-  const result = await rpc<{ roomCode: string; matchId: string; snapshot: Snapshot }>('create_room', {
+  const result = await rpc<RoomRpcResult>('create_room', {
     username: getUsername(),
     gridSize: Number(gridSizeInput.value),
   });
 
-  log(`Create room response: roomCode="${result.roomCode}" (length: ${result.roomCode.length})`);
   roomCodeInput.value = result.roomCode;
-
-  // Now, call joinRoomWithCode as a player (not spectator)
   await joinRoomWithCode(result.roomCode, false);
 }
 
 async function joinRoomWithCode(roomCode: string, spectator: boolean) {
-  log(`joinRoomWithCode: roomCode="${roomCode}" (length: ${roomCode.length})`);
-  
-  if (!validateRoomCode(roomCode)) {
-    showErrorNotification('Invalid room code. Must be 6 alphanumeric characters (e.g., ABC123).');
+  if (!state.isConnected || !state.socket) {
+    showErrorNotification('Not connected. Please connect first.');
     return;
   }
-  
-  const result = await rpc<{ roomCode: string; matchId: string; snapshot: Snapshot }>('join_room', {
-    roomCode,
+
+  const normalizedCode = roomCode.trim().toUpperCase();
+  if (!validateRoomCode(normalizedCode)) {
+    showErrorNotification('Invalid room code. Must be 6 alphanumeric characters.');
+    return;
+  }
+
+  const result = await rpc<RoomRpcResult>('join_room', {
+    roomCode: normalizedCode,
     username: getUsername(),
     spectator,
   });
+
   state.isSpectator = spectator;
   state.currentMatchId = result.matchId;
   state.snapshot = result.snapshot;
-  try {
-    await state.socket!.joinMatch(result.matchId);
-    log(`[joinMatch] Successfully joined match: ${result.matchId}`);
-  } catch (err) {
-    log(`[joinMatch] Failed to join match: ${extractErrorMessage(err)}`);
-    showErrorNotification('Failed to join match. Please refresh and try again.');
-    return;
+  roomCodeInput.value = result.roomCode;
+  saveRoomState(result.roomCode, spectator);
+
+  if (state.session) {
+    state.currentUserId = state.session.user_id;
   }
-  log(`${spectator ? 'Spectating' : 'Joined'} room ${roomCode}.`);
+
+  await state.socket.joinMatch(result.matchId);
+  log(`${spectator ? 'Spectating' : 'Joined'} room ${result.roomCode}.`);
   render();
 }
 
 async function joinRoom(spectator: boolean) {
-  if (!state.isConnected) {
-    showErrorNotification('Not connected. Please connect first.');
-    return;
-  }
-  
-  const roomCode = roomCodeInput.value.trim().toUpperCase();
-  log(`joinRoom: roomCode input = "${roomCode}" (length: ${roomCode.length})`);
-  
-  await joinRoomWithCode(roomCode, spectator);
+  await joinRoomWithCode(roomCodeInput.value, spectator);
 }
 
 async function refreshHistory() {
   const result = await rpc<{ items: HistoryEntry[] }>('list_history', {});
   const items = result.items || [];
-  historyEl.innerHTML = items.length === 0
-    ? '<div class="small">No completed matches yet.</div>'
-    : items.slice().reverse().map((entry) => `
+
+  historyEl.innerHTML =
+    items.length === 0
+      ? '<div class="small">No completed matches yet.</div>'
+      : items
+          .slice()
+          .reverse()
+          .map(
+            (entry) => `
       <div class="history-item">
         <div><strong>${entry.roomCode}</strong> · ${entry.gridSize}x${entry.gridSize} dots · ${entry.moves} moves</div>
         <div class="small">Finished ${new Date(entry.finishedAt).toLocaleString()} · Duration ${entry.durationSec}s</div>
-        <div class="small">Winners: ${entry.winnerIds.map((id) => entry.players.find((p) => p.userId === id)?.username || id).join(', ') || 'Draw'}</div>
+        <div class="small">Winners: ${
+          entry.winnerIds.map((id) => entry.players.find((p) => p.userId === id)?.username || id).join(', ') || 'Draw'
+        }</div>
       </div>
-    `).join('');
+    `
+          )
+          .join('');
 }
 
 function edgeKey(aX: number, aY: number, bX: number, bY: number): string {
-  const [p1, p2] = [[aX, aY], [bX, bY]].sort((lhs, rhs) => lhs[0] === rhs[0] ? lhs[1] - rhs[1] : lhs[0] - rhs[0]);
+  const points = [[aX, aY], [bX, bY]].sort((lhs, rhs) =>
+    lhs[0] === rhs[0] ? lhs[1] - rhs[1] : lhs[0] - rhs[0]
+  );
+  const p1 = points[0];
+  const p2 = points[1];
   return `${p1[0]},${p1[1]}-${p2[0]},${p2[1]}`;
 }
 
 async function sendMove(key: string) {
   if (!state.socket || !state.currentMatchId || !state.snapshot || state.isSpectator) return;
-  await state.socket.sendMatchState(state.currentMatchId, OpCode.MOVE, JSON.stringify({ edgeKey: key }));
+
+  await state.socket.sendMatchState(
+    state.currentMatchId,
+    OpCode.MOVE,
+    JSON.stringify({ edgeKey: key })
+  );
 }
 
-function playerName(userId: string) {
+function playerName(userId: string): string {
   return state.snapshot?.players.find((p) => p.userId === userId)?.username || userId;
 }
 
-function colorFor(userId?: string | null) {
+function colorFor(userId?: string | null): string {
   return state.snapshot?.players.find((p) => p.userId === userId)?.color || '#64748b';
 }
 
 function handleBoardClick(e: Event) {
-  const btn = (e.target as HTMLElement).closest('[data-edge]');
-  if (btn?.dataset.edge) {
-    sendMove(btn.dataset.edge).catch((err) => log(String(err)));
-  }
+  const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-edge]');
+  const key = btn?.dataset.edge;
+  if (!key) return;
+
+  sendMove(key).catch((err) => {
+    const msg = extractErrorMessage(err);
+    log(msg);
+    showErrorNotification(msg);
+  });
 }
 
 function renderBoard() {
-  // Remove old event listener
   boardMount.removeEventListener('click', handleBoardClick);
 
   if (!state.snapshot) {
@@ -456,6 +621,7 @@ function renderBoard() {
 
   const n = state.snapshot.gridSize - 1;
   const cells: string[] = [];
+
   for (let y = 0; y < n; y += 1) {
     for (let x = 0; x < n; x += 1) {
       const top = edgeKey(x, y, x + 1, y);
@@ -463,22 +629,34 @@ function renderBoard() {
       const bottom = edgeKey(x, y + 1, x + 1, y + 1);
       const right = edgeKey(x + 1, y, x + 1, y + 1);
       const boxOwner = state.snapshot.boxes[`${x},${y}`];
+
       const parts = [
         ['t', top],
         ['l', left],
         ['b', bottom],
         ['r', right],
-      ].map(([cls, key]) => {
-        const owner = state.snapshot!.edges[key];
-        const style = owner ? `style="background:${colorFor(owner)}"` : '';
-        const disabled = Boolean(owner) || state.snapshot!.status !== 'active' || state.snapshot!.currentTurnUserId !== state.currentUserId || state.isSpectator;
-        return `<button class="edge ${cls}" data-edge="${key}" ${style} ${disabled ? 'disabled' : ''}></button>`;
-      }).join('');
+      ]
+        .map(([cls, key]) => {
+          const owner = state.snapshot!.edges[key];
+          const style = owner ? `style="background:${colorFor(owner)}"` : '';
+          const disabled =
+            Boolean(owner) ||
+            state.snapshot!.status !== 'active' ||
+            state.snapshot!.currentTurnUserId !== state.currentUserId ||
+            state.isSpectator;
+
+          return `<button class="edge ${cls}" data-edge="${key}" ${style} ${disabled ? 'disabled' : ''}></button>`;
+        })
+        .join('');
 
       cells.push(`
         <div class="cell">
           ${parts}
-          ${boxOwner ? `<div class="box" style="background:${colorFor(boxOwner)}">${playerName(boxOwner).slice(0, 1).toUpperCase()}</div>` : ''}
+          ${
+            boxOwner
+              ? `<div class="box" style="background:${colorFor(boxOwner)}">${playerName(boxOwner).slice(0, 1).toUpperCase()}</div>`
+              : ''
+          }
           <span class="dot tl"></span><span class="dot tr"></span><span class="dot bl"></span><span class="dot br"></span>
         </div>
       `);
@@ -486,8 +664,6 @@ function renderBoard() {
   }
 
   boardMount.innerHTML = `<div class="board" style="grid-template-columns: repeat(${n}, 56px)">${cells.join('')}</div>`;
-  
-  // Add single delegated event listener
   boardMount.addEventListener('click', handleBoardClick);
 }
 
@@ -509,17 +685,26 @@ function render() {
     <p class="small">Players connected: ${state.snapshot.players.filter((p) => p.isConnected).length}/${state.snapshot.players.length}. Spectators: ${state.snapshot.spectators.length}.</p>
   `;
 
-  scores.innerHTML = state.snapshot.players.map((player) => `
-    <div class="score-card">
-      <div><strong style="color:${player.color}">${player.username}</strong></div>
-      <div>Score: ${state.snapshot!.scores[player.userId] ?? 0}</div>
-      <div class="small">${player.isConnected ? 'Connected' : 'Disconnected'}</div>
-    </div>
-  `).join('');
+  scores.innerHTML = state.snapshot.players
+    .map(
+      (player) => `
+        <div class="score-card">
+          <div><strong style="color:${player.color}">${player.username}</strong></div>
+          <div>Score: ${state.snapshot!.scores[player.userId] ?? 0}</div>
+          <div class="small">${player.isConnected ? 'Connected' : 'Disconnected'}</div>
+        </div>
+      `
+    )
+    .join('');
 
-  if (state.snapshot.status === 'finished') {
+  if (
+    state.snapshot.status === 'finished' &&
+    state.snapshot.finishedAt &&
+    state.lastFinishedAtLogged !== state.snapshot.finishedAt
+  ) {
     const winners = state.snapshot.winnerIds.map((id) => playerName(id)).join(', ');
     log(`Game finished. Winner${state.snapshot.winnerIds.length > 1 ? 's' : ''}: ${winners}`);
+    state.lastFinishedAtLogged = state.snapshot.finishedAt;
   }
 
   renderBoard();
@@ -531,12 +716,16 @@ joinBtn.addEventListener('click', addErrorHandler(() => joinRoom(false), 'Join r
 spectateBtn.addEventListener('click', addErrorHandler(() => joinRoom(true), 'Spectate'));
 refreshHistoryBtn.addEventListener('click', addErrorHandler(refreshHistory, 'Refresh history'));
 
-// --- Auto-connect on page load if session token exists ---
-if (loadSessionToken()) {
+const restoredSession = loadSession();
+if (restoredSession) {
+  state.session = restoredSession;
   connect().catch((err) => {
-    log('Auto-connect failed: ' + extractErrorMessage(err));
+    log(`Auto-connect failed: ${extractErrorMessage(err)}`);
     clearSession();
+    clearRoomState();
+    setConnectedUi(false);
   });
 }
 
+setConnectedUi(false);
 render();
