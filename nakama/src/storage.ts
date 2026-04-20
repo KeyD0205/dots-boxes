@@ -1,3 +1,4 @@
+/// <reference path="../node_modules/nakama-runtime/index.d.ts" />
 import { MatchHistoryRecord, RoomRecord, SerializedState } from './types';
 
 const ROOM_COLLECTION = 'room';

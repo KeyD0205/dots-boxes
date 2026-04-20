@@ -1,3 +1,5 @@
+/// <reference path="../node_modules/nakama-runtime/index.d.ts" />
+
 export type PresenceRef = {
   userId: string;
   sessionId: string;

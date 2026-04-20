@@ -1,3 +1,4 @@
+/// <reference path="../node_modules/nakama-runtime/index.d.ts" />
 import { addPlayer, applyMove, createInitialSnapshot, markDisconnected, normalizeGridSize, startIfReady } from './game';
 import { buildHistory, buildRoomRecord, readRoom, writeHistory, writeRoom } from './storage';
 import { CreateRoomPayload, JoinRoomPayload, MatchState, OpCode, PresenceRef, SerializedState } from './types';
@@ -350,7 +351,7 @@ function matchLoop(
 
     var payload: { edgeKey: string };
     try {
-      payload = JSON.parse(message.data);
+      payload = JSON.parse(typeof message.data === 'string' ? message.data : new TextDecoder().decode(message.data));
     } catch (_err) {
       dispatcher.broadcastMessage(
         OpCode.ERROR,
