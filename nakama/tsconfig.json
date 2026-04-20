@@ -13,10 +13,8 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "types": [
-      "jest"
-    ],
-    "typeRoots": [
-      "./node_modules"
+      "jest",
+      "node"
     ]
   },
   "include": [
