@@ -130,12 +130,14 @@ export function createInitialSnapshot(roomCode: string, gridSize: number, creato
 
 /**
  * Add a player to the game snapshot, or reconnect if already present.
+ * Also removes the user from spectators if they are joining as a player.
  */
 export function addPlayer(snapshot: SerializedState, userId: string, username: string): SerializedState {
   if (snapshot.players.some((p) => p.userId === userId)) {
     return {
       ...snapshot,
       players: snapshot.players.map((p) => p.userId === userId ? { ...p, isConnected: true, username } : p),
+      spectators: snapshot.spectators.filter((s) => s.userId !== userId),
     };
   }
 
@@ -146,9 +148,11 @@ export function addPlayer(snapshot: SerializedState, userId: string, username: s
     isConnected: true,
     joinedAt: new Date().toISOString(),
   };
+
   return {
     ...snapshot,
     players: [...snapshot.players, player],
+    spectators: snapshot.spectators.filter((s) => s.userId !== userId),
     scores: { ...snapshot.scores, [userId]: snapshot.scores[userId] ?? 0 },
     currentTurnUserId: snapshot.currentTurnUserId ?? userId,
   };
@@ -191,16 +195,23 @@ export function totalPossibleEdges(gridSize: number): number {
 
 
 /**
- * Get the userId of the next player in turn order.
+ * Get the userId of the next connected player in turn order.
+ * If no connected players remain, return null.
  */
 function nextTurn(snapshot: SerializedState, currentUserId: string): string | null {
-  if (snapshot.players.length === 0) return null;
+  const connectedPlayers = snapshot.players.filter((p) => p.isConnected);
+  if (connectedPlayers.length === 0) return null;
+
   let idx = -1;
-  for (let i = 0; i < snapshot.players.length; i += 1) {
-    if (snapshot.players[i].userId === currentUserId) { idx = i; break; }
+  for (let i = 0; i < connectedPlayers.length; i += 1) {
+    if (connectedPlayers[i].userId === currentUserId) {
+      idx = i;
+      break;
+    }
   }
-  if (idx < 0) return snapshot.players[0].userId;
-  return snapshot.players[(idx + 1) % snapshot.players.length].userId;
+
+  if (idx < 0) return connectedPlayers[0].userId;
+  return connectedPlayers[(idx + 1) % connectedPlayers.length].userId;
 }
 
 
