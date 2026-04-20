@@ -59,6 +59,55 @@ make down
 
 ---
 
+## Development
+
+### Building the Nakama runtime
+
+The Nakama runtime is TypeScript-based and compiles to JavaScript.
+
+```bash
+cd nakama
+npm install
+npm run build
+```
+
+The build output goes to `nakama/build/index.js`, which is copied into the Docker image.
+
+### Testing
+
+Run the Jest tests locally:
+
+```bash
+cd nakama
+npm test
+```
+
+Or from the root:
+
+```bash
+make test
+```
+
+### Type checking
+
+The project uses `nakama-runtime` type definitions from the GitHub package. If you encounter "Cannot find namespace 'nkruntime'" errors:
+
+1. Ensure `moduleResolution` in `tsconfig.json` is set to `"node"` (not `"bundler"`)
+2. Use triple-slash references in source files:
+   ```typescript
+   /// <reference path="../node_modules/nakama-runtime/index.d.ts" />
+   ```
+
+### Docker build
+
+To build just the Nakama container:
+
+```bash
+docker compose build --no-cache nakama
+```
+
+---
+
 ## Repo layout
 
 ```text
