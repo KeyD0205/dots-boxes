@@ -2,8 +2,6 @@ import { addPlayer, applyMove, createInitialSnapshot, markDisconnected, normaliz
 import { buildHistory, buildRoomRecord, readRoom, writeHistory, writeRoom } from './storage';
 import { CreateRoomPayload, JoinRoomPayload, MatchState, OpCode, PresenceRef, SerializedState } from './types';
 
-declare const console: any;
-
 function json<T>(payload: string): T {
   return payload ? JSON.parse(payload) as T : {} as T;
 }
@@ -28,11 +26,11 @@ function serialize(state: MatchState): SerializedState {
   };
 }
 
-function eventPayload(type: string, data: Record<string, unknown>) {
+function eventPayload(type: string, data: Record<string, unknown>): string {
   return JSON.stringify({ type, data, at: new Date().toISOString() });
 }
 
-function statePayload(state: MatchState) {
+function statePayload(state: MatchState): string {
   return JSON.stringify({
     roomCode: state.roomCode,
     matchId: state.matchId,
@@ -41,171 +39,343 @@ function statePayload(state: MatchState) {
 }
 
 function randomRoomCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let out = '';
-  for (let i = 0; i < 6; i += 1) out += chars[Math.floor(Math.random() * chars.length)];
+  var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  var out = '';
+  for (var i = 0; i < 6; i += 1) {
+    out += chars[Math.floor(Math.random() * chars.length)];
+  }
   return out;
 }
 
-function ensureRuntimeMatch(nk: nkruntime.Nakama, logger: nkruntime.Logger, roomCode: string): { room: any; matchId: string } {
-  const room = readRoom(nk, roomCode);
+function ensureRuntimeMatch(
+  nk: nkruntime.Nakama,
+  logger: nkruntime.Logger,
+  roomCode: string
+): { room: any; matchId: string } {
+  var room = readRoom(nk, roomCode);
   if (!room) {
     throw new Error('Room not found.');
   }
 
-  let validMatch = true;
+  var validMatch = true;
   try {
     nk.matchGet(room.matchId);
   } catch (_err) {
     validMatch = false;
   }
 
-  if (validMatch) return { room, matchId: room.matchId };
+  if (validMatch) {
+    return { room: room, matchId: room.matchId };
+  }
 
-  const recreatedMatchId = nk.matchCreate('dots_boxes', { roomCode, snapshot: room.snapshot });
-  const updated = { ...room, matchId: recreatedMatchId, updatedAt: new Date().toISOString() };
+  var recreatedMatchId = nk.matchCreate('dots_boxes', { roomCode: roomCode, snapshot: room.snapshot });
+  var updated = {
+    roomCode: room.roomCode,
+    matchId: recreatedMatchId,
+    gridSize: room.gridSize,
+    status: room.status,
+    createdAt: room.createdAt,
+    updatedAt: new Date().toISOString(),
+    createdBy: room.createdBy,
+    playerOrder: room.playerOrder,
+    snapshot: room.snapshot,
+    completedAt: room.completedAt,
+    winnerIds: room.winnerIds,
+  };
+
   writeRoom(nk, updated);
   logger.info('Recovered room %s into new match %s', roomCode, recreatedMatchId);
   return { room: updated, matchId: recreatedMatchId };
 }
 
-const createRoomRpc: nkruntime.RpcFunction = function (ctx, logger, nk, payload) {
-  const body = json<CreateRoomPayload>(payload);
-  if (!ctx.userId) throw new Error('Authentication required.');
-  const username = body.username?.trim() || ctx.username || `Player-${ctx.userId.slice(0, 6)}`;
-  const gridSize = normalizeGridSize(body.gridSize);
+function createRoomRpc(
+  ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  payload: string
+): string {
+  var body = json<CreateRoomPayload>(payload);
+  if (!ctx.userId) {
+    throw new Error('Authentication required.');
+  }
 
-  let roomCode = randomRoomCode();
-  while (readRoom(nk, roomCode)) roomCode = randomRoomCode();
+  var username = (body.username && body.username.trim()) || ctx.username || ('Player-' + ctx.userId.slice(0, 6));
+  var gridSize = normalizeGridSize(body.gridSize);
 
-  const snapshot = createInitialSnapshot(roomCode, gridSize, { userId: ctx.userId, username });
-  const matchId = nk.matchCreate('dots_boxes', { roomCode, snapshot });
-  const room = buildRoomRecord(snapshot, matchId, ctx.userId);
+  var roomCode = randomRoomCode();
+  while (readRoom(nk, roomCode)) {
+    roomCode = randomRoomCode();
+  }
+
+  var snapshot = createInitialSnapshot(roomCode, gridSize, { userId: ctx.userId, username: username });
+  var matchId = nk.matchCreate('dots_boxes', { roomCode: roomCode, snapshot: snapshot });
+  var room = buildRoomRecord(snapshot, matchId, ctx.userId);
+
   writeRoom(nk, room);
   logger.info('Created room %s match %s', roomCode, matchId);
 
-  return JSON.stringify({ roomCode, matchId, snapshot });
-};
+  return JSON.stringify({ roomCode: roomCode, matchId: matchId, snapshot: snapshot });
+}
 
-const joinRoomRpc: nkruntime.RpcFunction = function (ctx, logger, nk, payload) {
-  const body = json<JoinRoomPayload>(payload);
-  if (!ctx.userId) throw new Error('Authentication required.');
-  const roomCode = body.roomCode?.trim().toUpperCase();
-  if (!roomCode) throw new Error('roomCode is required.');
-  const { room, matchId } = ensureRuntimeMatch(nk, logger, roomCode);
-  const username = body.username?.trim() || ctx.username || `Player-${ctx.userId.slice(0, 6)}`;
+function joinRoomRpc(
+  ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  payload: string
+): string {
+  var body = json<JoinRoomPayload>(payload);
+  if (!ctx.userId) {
+    throw new Error('Authentication required.');
+  }
 
-  let snapshot = room.snapshot as SerializedState;
+  var roomCode = body.roomCode ? body.roomCode.trim().toUpperCase() : '';
+  if (!roomCode) {
+    throw new Error('roomCode is required.');
+  }
+
+  var ensured = ensureRuntimeMatch(nk, logger, roomCode);
+  var room = ensured.room;
+  var matchId = ensured.matchId;
+  var username = (body.username && body.username.trim()) || ctx.username || ('Player-' + ctx.userId.slice(0, 6));
+
+  var snapshot = room.snapshot as SerializedState;
   if (!body.spectator && snapshot.status !== 'finished') {
     snapshot = addPlayer(snapshot, ctx.userId, username);
     snapshot = startIfReady(snapshot);
   }
 
-  const updatedRoom = buildRoomRecord(snapshot, matchId, room.createdBy);
+  var updatedRoom = buildRoomRecord(snapshot, matchId, room.createdBy);
   writeRoom(nk, updatedRoom);
 
   return JSON.stringify({
-    roomCode,
-    matchId,
-    snapshot,
+    roomCode: roomCode,
+    matchId: matchId,
+    snapshot: snapshot,
     spectator: Boolean(body.spectator),
   });
-};
+}
 
-const getRoomRpc: nkruntime.RpcFunction = function (_ctx, logger, nk, payload) {
-  const body = json<{ roomCode: string }>(payload);
-  const roomCode = body.roomCode?.trim().toUpperCase();
-  if (!roomCode) throw new Error('roomCode is required.');
-  const { room, matchId } = ensureRuntimeMatch(nk, logger, roomCode);
-  return JSON.stringify({ roomCode, matchId, snapshot: room.snapshot });
-};
+function getRoomRpc(
+  _ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  payload: string
+): string {
+  var body = json<{ roomCode: string }>(payload);
+  var roomCode = body.roomCode ? body.roomCode.trim().toUpperCase() : '';
+  if (!roomCode) {
+    throw new Error('roomCode is required.');
+  }
 
-const listHistoryRpc: nkruntime.RpcFunction = function (_ctx, _logger, nk, _payload) {
-  const records = (nk as any).storageList('00000000-0000-0000-0000-000000000000', 'match_history', 50, '', '');
-  return JSON.stringify({ items: (records.objects || []).map((o: any) => o.value) });
-};
+  var ensured = ensureRuntimeMatch(nk, logger, roomCode);
+  return JSON.stringify({
+    roomCode: roomCode,
+    matchId: ensured.matchId,
+    snapshot: ensured.room.snapshot,
+  });
+}
 
-const matchInit: nkruntime.MatchInitFunction<MatchState> = function (_ctx, logger, _nk, params) {
-  const snapshot = (params.snapshot ?? null) as SerializedState | null;
-  if (!snapshot) throw new Error('snapshot required');
+function listHistoryRpc(
+  _ctx: nkruntime.Context,
+  _logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  _payload: string
+): string {
+  var records = (nk as any).storageList('00000000-0000-0000-0000-000000000000', 'match_history', 50, '', '');
+  var objects = (records && records.objects) ? records.objects : [];
+  return JSON.stringify({
+    items: objects.map(function (o: any) { return o.value; }),
+  });
+}
+
+function matchInit(
+  _ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  _nk: nkruntime.Nakama,
+  params: any
+) {
+  var snapshot = (params && params.snapshot) ? params.snapshot as SerializedState : null;
+  if (!snapshot) {
+    throw new Error('snapshot required');
+  }
+
   logger.info('Initializing dots_boxes for room %s', snapshot.roomCode);
+
   return {
     state: {
-      ...snapshot,
+      roomCode: snapshot.roomCode,
+      gridSize: snapshot.gridSize,
+      status: snapshot.status,
+      createdAt: snapshot.createdAt,
+      startedAt: snapshot.startedAt,
+      finishedAt: snapshot.finishedAt,
+      currentTurnUserId: snapshot.currentTurnUserId,
+      players: snapshot.players,
+      spectators: snapshot.spectators,
+      edges: snapshot.edges,
+      boxes: snapshot.boxes,
+      scores: snapshot.scores,
+      moveLog: snapshot.moveLog,
+      winnerIds: snapshot.winnerIds,
+      reconnectGraceSec: snapshot.reconnectGraceSec,
       presences: {},
       matchId: '',
     },
     tickRate: 5,
-    label: `roomCode=${snapshot.roomCode}`,
+    label: 'roomCode=' + snapshot.roomCode,
   };
-};
+}
 
-const matchJoinAttempt: nkruntime.MatchJoinAttemptFunction<MatchState> = function (_ctx, _logger, _nk, _dispatcher, _tick, state, presence, metadata) {
-  const spectator = Boolean((metadata as any)?.spectator);
-  if (!spectator && state.status === 'finished' && !state.players.some((p) => p.userId === presence.userId)) {
-    return { state, accept: false, rejectMessage: 'Finished game is read-only.' };
-  }
-  return { state, accept: true };
-};
-
-const matchJoin: nkruntime.MatchJoinFunction<MatchState> = function (_ctx, _logger, nk, dispatcher, _tick, state, presences) {
-  state.matchId = state.matchId || (_ctx.matchId ?? '');
-  for (const presence of presences) {
-    state.presences[presence.userId] = presence;
-    var existingPlayer = null as any;
-    for (var i = 0; i < state.players.length; i += 1) {
-      if (state.players[i].userId === presence.userId) { existingPlayer = state.players[i]; break; }
+function matchJoinAttempt(
+  _ctx: nkruntime.Context,
+  _logger: nkruntime.Logger,
+  _nk: nkruntime.Nakama,
+  _dispatcher: nkruntime.MatchDispatcher,
+  _tick: number,
+  state: MatchState,
+  presence: nkruntime.Presence,
+  metadata: { [key: string]: any }
+) {
+  var spectator = Boolean(metadata && metadata.spectator);
+  var isExistingPlayer = false;
+  for (var i = 0; i < state.players.length; i += 1) {
+    if (state.players[i].userId === presence.userId) {
+      isExistingPlayer = true;
+      break;
     }
+  }
+
+  if (!spectator && state.status === 'finished' && !isExistingPlayer) {
+    return { state: state, accept: false, rejectMessage: 'Finished game is read-only.' };
+  }
+
+  return { state: state, accept: true };
+}
+
+function matchJoin(
+  ctx: nkruntime.Context,
+  _logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  dispatcher: nkruntime.MatchDispatcher,
+  _tick: number,
+  state: MatchState,
+  presences: nkruntime.Presence[]
+) {
+  state.matchId = state.matchId || ctx.matchId || '';
+
+  for (var p = 0; p < presences.length; p += 1) {
+    var presence = presences[p];
+    state.presences[presence.userId] = presence;
+
+    var existingPlayer: any = null;
+    for (var i = 0; i < state.players.length; i += 1) {
+      if (state.players[i].userId === presence.userId) {
+        existingPlayer = state.players[i];
+        break;
+      }
+    }
+
     if (existingPlayer) {
       existingPlayer.isConnected = true;
       existingPlayer.username = presence.username || existingPlayer.username;
     } else {
-      const spectator: PresenceRef = {
+      var spectator: PresenceRef = {
         userId: presence.userId,
         sessionId: presence.sessionId,
         username: presence.username,
         node: presence.node,
       };
-      state.spectators = state.spectators.filter((s) => s.userId !== presence.userId).concat([spectator]);
+
+      var filteredSpectators: PresenceRef[] = [];
+      for (var s = 0; s < state.spectators.length; s += 1) {
+        if (state.spectators[s].userId !== presence.userId) {
+          filteredSpectators.push(state.spectators[s]);
+        }
+      }
+      filteredSpectators.push(spectator);
+      state.spectators = filteredSpectators;
     }
   }
-  writeRoom(nk, buildRoomRecord(serialize(state), state.matchId, state.players[0]?.userId ?? ''));
+
+  writeRoom(nk, buildRoomRecord(serialize(state), state.matchId, state.players.length ? state.players[0].userId : ''));
+
   dispatcher.broadcastMessage(OpCode.STATE, statePayload(state), presences, null, true);
-  dispatcher.broadcastMessage(OpCode.EVENT, eventPayload('presence_joined', { userIds: presences.map((p) => p.userId) }));
-  return { state };
-};
+  dispatcher.broadcastMessage(OpCode.EVENT, eventPayload('presence_joined', {
+    userIds: presences.map(function (presence) { return presence.userId; }),
+  }));
 
-const matchLeave: nkruntime.MatchLeaveFunction<MatchState> = function (_ctx, _logger, nk, dispatcher, _tick, state, presences) {
-  for (const presence of presences) {
+  return { state: state };
+}
+
+function matchLeave(
+  _ctx: nkruntime.Context,
+  _logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  dispatcher: nkruntime.MatchDispatcher,
+  _tick: number,
+  state: MatchState,
+  presences: nkruntime.Presence[]
+) {
+  for (var p = 0; p < presences.length; p += 1) {
+    var presence = presences[p];
     delete state.presences[presence.userId];
-    Object.assign(state, markDisconnected(serialize(state), presence.userId));
+    var updated = markDisconnected(serialize(state), presence.userId);
+    Object.assign(state, updated);
   }
-  writeRoom(nk, buildRoomRecord(serialize(state), state.matchId, state.players[0]?.userId ?? ''));
-  dispatcher.broadcastMessage(OpCode.EVENT, eventPayload('presence_left', { userIds: presences.map((p) => p.userId) }));
-  dispatcher.broadcastMessage(OpCode.STATE, statePayload(state));
-  return { state };
-};
 
-const matchLoop: nkruntime.MatchLoopFunction<MatchState> = function (_ctx, logger, nk, dispatcher, _tick, state, messages) {
-  for (const message of messages) {
-    if (message.opCode !== OpCode.MOVE) continue;
-    let payload: { edgeKey: string };
-    try {
-      payload = JSON.parse(message.data);
-    } catch (_err) {
-      dispatcher.broadcastMessage(OpCode.ERROR, eventPayload('invalid_payload', { reason: 'Malformed JSON.' }), [message.sender]);
+  writeRoom(nk, buildRoomRecord(serialize(state), state.matchId, state.players.length ? state.players[0].userId : ''));
+
+  dispatcher.broadcastMessage(OpCode.EVENT, eventPayload('presence_left', {
+    userIds: presences.map(function (presence) { return presence.userId; }),
+  }));
+  dispatcher.broadcastMessage(OpCode.STATE, statePayload(state));
+
+  return { state: state };
+}
+
+function matchLoop(
+  _ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  dispatcher: nkruntime.MatchDispatcher,
+  _tick: number,
+  state: MatchState,
+  messages: nkruntime.MatchMessage[]
+) {
+  for (var m = 0; m < messages.length; m += 1) {
+    var message = messages[m];
+    if (message.opCode !== OpCode.MOVE) {
       continue;
     }
 
-    const result = applyMove(serialize(state), message.sender.userId, payload.edgeKey);
+    var payload: { edgeKey: string };
+    try {
+      payload = JSON.parse(message.data);
+    } catch (_err) {
+      dispatcher.broadcastMessage(
+        OpCode.ERROR,
+        eventPayload('invalid_payload', { reason: 'Malformed JSON.' }),
+        [message.sender]
+      );
+      continue;
+    }
+
+    var result = applyMove(serialize(state), message.sender.userId, payload.edgeKey);
     if (result.error) {
-      dispatcher.broadcastMessage(OpCode.ERROR, eventPayload('move_rejected', { reason: result.error }), [message.sender]);
+      dispatcher.broadcastMessage(
+        OpCode.ERROR,
+        eventPayload('move_rejected', { reason: result.error }),
+        [message.sender]
+      );
       continue;
     }
 
     Object.assign(state, result.snapshot);
+
     logger.info('Room %s accepted move %s from %s', state.roomCode, payload.edgeKey, message.sender.userId);
-    writeRoom(nk, buildRoomRecord(serialize(state), state.matchId, state.players[0]?.userId ?? ''));
+
+    writeRoom(nk, buildRoomRecord(serialize(state), state.matchId, state.players.length ? state.players[0].userId : ''));
+
     dispatcher.broadcastMessage(OpCode.STATE, statePayload(state));
     dispatcher.broadcastMessage(OpCode.EVENT, eventPayload('move_accepted', {
       playerId: message.sender.userId,
@@ -221,34 +391,58 @@ const matchLoop: nkruntime.MatchLoopFunction<MatchState> = function (_ctx, logge
       }));
     }
   }
-  return { state };
-};
 
-const matchTerminate: nkruntime.MatchTerminateFunction<MatchState> = function (_ctx, _logger, nk, dispatcher, _tick, state, _graceSeconds) {
-  writeRoom(nk, buildRoomRecord(serialize(state), state.matchId, state.players[0]?.userId ?? ''));
+  return { state: state };
+}
+
+function matchTerminate(
+  _ctx: nkruntime.Context,
+  _logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  dispatcher: nkruntime.MatchDispatcher,
+  _tick: number,
+  state: MatchState,
+  _graceSeconds: number
+) {
+  writeRoom(nk, buildRoomRecord(serialize(state), state.matchId, state.players.length ? state.players[0].userId : ''));
   dispatcher.broadcastMessage(OpCode.EVENT, eventPayload('match_terminating', { roomCode: state.roomCode }));
-  return { state };
-};
+  return { state: state };
+}
 
-const matchSignal: nkruntime.MatchSignalFunction<MatchState> = function (_ctx, _logger, _nk, _dispatcher, _tick, state, data) {
-  return { state, data };
-};
+function matchSignal(
+  _ctx: nkruntime.Context,
+  _logger: nkruntime.Logger,
+  _nk: nkruntime.Nakama,
+  _dispatcher: nkruntime.MatchDispatcher,
+  _tick: number,
+  state: MatchState,
+  data: string
+) {
+  return { state: state, data: data };
+}
 
-let InitModule: nkruntime.InitModule = function (_ctx, logger, _nk, initializer) {
+function InitModule(
+  _ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  _nk: nkruntime.Nakama,
+  initializer: nkruntime.Initializer
+) {
   initializer.registerRpc('create_room', createRoomRpc);
   initializer.registerRpc('join_room', joinRoomRpc);
   initializer.registerRpc('get_room', getRoomRpc);
   initializer.registerRpc('list_history', listHistoryRpc);
-  initializer.registerMatch('dots_boxes', {
-    matchInit,
-    matchJoinAttempt,
-    matchJoin,
-    matchLeave,
-    matchLoop,
-    matchTerminate,
-    matchSignal,
-  });
-  logger.info('Dots and Boxes runtime loaded.');
-};
 
-(globalThis as any).InitModule = InitModule;
+  initializer.registerMatch('dots_boxes', {
+    matchInit: matchInit,
+    matchJoinAttempt: matchJoinAttempt,
+    matchJoin: matchJoin,
+    matchLeave: matchLeave,
+    matchLoop: matchLoop,
+    matchTerminate: matchTerminate,
+    matchSignal: matchSignal,
+  });
+
+  logger.info('Dots and Boxes runtime loaded.');
+}
+
+!InitModule && InitModule.bind(null);

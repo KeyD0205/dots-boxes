@@ -11,6 +11,6 @@ console:
   email: admin@admin.com
 runtime:
   path: /nakama/data/modules/build
-  js_entrypoint: /nakama/data/modules/build/index.js
+  js_entrypoint: index.js
 match:
   max_empty_sec: 0
