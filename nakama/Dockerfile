@@ -3,7 +3,7 @@ WORKDIR /app
 
 RUN apk add --no-cache git
 
-COPY package.json tsconfig.json jest.config.js rollup.config.js babel.config.js ./
+COPY package.json tsconfig.json jest.config.js rollup.config.js ./
 COPY src ./src
 RUN npm install && npm run build
 

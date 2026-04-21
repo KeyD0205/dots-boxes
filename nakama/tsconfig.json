@@ -3,9 +3,9 @@
     "target": "ES2019",
     "module": "ESNext",
     "lib": [
-      "ES2020"
+      "ES2019"
     ],
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "outDir": "build",
     "rootDir": ".",
     "strict": true,
