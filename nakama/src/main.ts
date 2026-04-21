@@ -2,7 +2,7 @@
 
 import { addPlayer, applyMove, createInitialSnapshot, markDisconnected, normalizeGridSize, startIfReady } from './game';
 import { buildHistory, buildRoomRecord, readRoom, writeHistory, writeRoom } from './storage';
-import { CreateRoomPayload, JoinRoomPayload, MatchState, OpCode, PresenceRef, SerializedState } from './types';
+import { CreateRoomPayload, EnsuredMatch, EventPayload, JoinRoomPayload, MatchHistoryRecord, MatchState, OpCode, PlayerSeat, PresenceRef, SerializedState, StatePayload } from './types';
 
 function randomRoomCode(): string {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -41,46 +41,51 @@ function serialize(state: MatchState): SerializedState {
   };
 }
 
-function eventPayload(type: string, data: any): any {
+function eventPayload<T>(type: string, data: T): EventPayload<T> {
   return {
     type: type,
     data: data,
   };
 }
 
-function statePayload(state: MatchState): any {
+function statePayload(state: MatchState): StatePayload {
   return {
     matchId: state.matchId,
     snapshot: serialize(state),
   };
 }
 
-function decodeMessageData(data: any): string {
+function decodeMessageData(data: unknown): string {
   if (typeof data === 'string') {
     return data;
   }
 
-  if (data && typeof data.length === 'number') {
-    var out = '';
-    for (var i = 0; i < data.length; i += 1) {
-      out += String.fromCharCode(data[i]);
+  var out = '';
+  var i = 0;
+
+  // Nakama 3.22+ / goja 0.0.20+: message.data arrives as an ArrayBuffer.
+  // ArrayBuffer has `byteLength`; wrap in Uint8Array to read individual bytes.
+  if (data !== null && typeof data === 'object' && typeof (data as { byteLength?: unknown }).byteLength === 'number') {
+    var bytes = new Uint8Array(data as ArrayBuffer);
+    for (i = 0; i < bytes.length; i += 1) {
+      out += String.fromCharCode(bytes[i]);
     }
     return out;
   }
 
-  if (data && data.buffer && typeof data.byteLength === 'number') {
-    var bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
-    var out2 = '';
-    for (var j = 0; j < bytes.length; j += 1) {
-      out2 += String.fromCharCode(bytes[j]);
+  // Older goja versions delivered binary messages as plain array-like objects.
+  if (data !== null && typeof data === 'object' && typeof (data as { length?: unknown }).length === 'number') {
+    var arrayLike = data as ArrayLike<number>;
+    for (i = 0; i < arrayLike.length; i += 1) {
+      out += String.fromCharCode(arrayLike[i] & 0xff);
     }
-    return out2;
+    return out;
   }
 
-  return String(data || '');
+  return String(data ?? '');
 }
 
-function ensureRuntimeMatch(nk: nkruntime.Nakama, logger: nkruntime.Logger, roomCode: string): any {
+function ensureRuntimeMatch(nk: nkruntime.Nakama, logger: nkruntime.Logger, roomCode: string): EnsuredMatch {
   var room = readRoom(nk, logger, roomCode);
   logger.info('[ensureRuntimeMatch] Lookup for roomCode=%s, found=%s', roomCode, !!room);
 
@@ -107,11 +112,10 @@ function ensureRuntimeMatch(nk: nkruntime.Nakama, logger: nkruntime.Logger, room
       snapshot: room.snapshot,
     });
 
-    var updated = {
-      ...room,
+    var updated = Object.assign({}, room, {
       matchId: recreatedMatchId,
       updatedAt: new Date().toISOString(),
-    };
+    });
 
     writeRoom(nk, logger, updated);
     logger.info('[ensureRuntimeMatch] Recovered room %s into new match %s', roomCode, recreatedMatchId);
@@ -233,10 +237,10 @@ function listHistoryRpc(
   _payload: string
 ): string {
   var records = (nk as any).storageList('00000000-0000-0000-0000-000000000000', 'match_history', 50, '', '');
-  var objects = (records && records.objects) ? records.objects : [];
+  var objects: Array<{ value: MatchHistoryRecord }> = (records && records.objects) ? records.objects : [];
 
   return JSON.stringify({
-    items: objects.map(function (o: any) { return o.value; }),
+    items: objects.map(function (o) { return o.value; }),
   });
 }
 
@@ -325,7 +329,7 @@ function matchJoin(
     var presence = presences[p];
     state.presences[presence.userId] = presence;
 
-    var existingPlayer: any = null;
+    var existingPlayer: PlayerSeat | null = null;
     for (var i = 0; i < state.players.length; i += 1) {
       if (state.players[i].userId === presence.userId) {
         existingPlayer = state.players[i];
@@ -456,9 +460,13 @@ function matchLoop(
 
     try {
       var raw = decodeMessageData(message.data);
+      if (!raw) {
+        throw new Error('empty payload (dataType=' + typeof message.data + ')');
+      }
       logger.info('Decoded move payload: %s', raw);
       payload = JSON.parse(raw);
-    } catch (_err) {
+    } catch (err) {
+      logger.warn('Move parse failed from %s: %s', message.sender.userId, String(err));
       dispatcher.broadcastMessage(
         OpCode.ERROR,
         JSON.stringify(eventPayload('invalid_payload', { reason: 'Malformed JSON.' })),
@@ -604,4 +612,5 @@ function InitModule(
   logger.info('Dots and Boxes runtime loaded.');
 }
 
+// Required Nakama InitModule registration pattern
 !InitModule && InitModule.bind(null);
