@@ -73,6 +73,21 @@ export type MatchState = SerializedState & {
   matchId: string;
 };
 
+export type EventPayload<T = unknown> = {
+  type: string;
+  data: T;
+};
+
+export type StatePayload = {
+  matchId: string;
+  snapshot: SerializedState;
+};
+
+export type EnsuredMatch = {
+  room: RoomRecord;
+  matchId: string;
+};
+
 export type JoinRoomPayload = {
   roomCode: string;
   username?: string;
